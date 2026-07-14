@@ -1,0 +1,17 @@
+[package]
+name = "artzain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "artzain"
+path = "src/main.rs"
+
+[dependencies]
+artzain-core.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,52 @@
+# Example artzain manifest — a small k8s-shaped desired state.
+#
+# Run it:   artzain -f examples/artzain.toml plan
+#           artzain -f examples/artzain.toml up --only web
+#
+# `bin` points at an already-built binary. artzain runs and supervises it; it
+# never builds, clones, or touches git.
+
+project = "example"
+
+# Per-machine paths without editing the file: `${root}` resolves from [vars],
+# overridable with ARTZAIN_VAR_ROOT=/some/path.
+[vars]
+root = "."
+
+# Env merged into every app (an app's own [app.env] wins). Backoff tuning too.
+[defaults]
+env = { RUST_LOG = "info" }
+restart_backoff_ms = 500
+restart_backoff_max_ms = 30000
+
+# External dependency artzain verifies before starting apps (but does not
+# manage). An app can `depends_on` it to defer its own start.
+[[check]]
+name = "postgres"
+tcp = "127.0.0.1:5432"
+hint = "brew services start postgresql@17"
+
+# A sutegi web app: 3 replicas on ports 8080, 8081, 8082. `PORT` is injected
+# per replica; readiness/liveness are probed on the sutegi built-ins.
+[[app]]
+name = "web"
+bin = "${root}/target/release/web"
+port = 8080
+replicas = 3
+env = { DATABASE_URL = "postgres://localhost/app" }
+depends_on = ["postgres"]
+ready_path = "/__ready"   # sutegi default
+live_path = "/__health"   # sutegi default
+ready_timeout = 60
+live_period = 5
+live_failures = 3
+
+# A single-instance background worker. No HTTP probes: an empty live_path
+# disables liveness, and with no readiness endpoint it's Ready once spawned.
+[[app]]
+name = "worker"
+bin = "${root}/target/release/worker"
+port = 9000
+replicas = 1
+live_path = ""
+depends_on = ["web"]

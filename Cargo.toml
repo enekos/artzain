@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/artzain-core",
+    "crates/artzain",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/enekosarasola/artzain"
+
+[workspace.dependencies]
+artzain-core = { path = "crates/artzain-core" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "io-util", "time", "signal", "sync"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = true
