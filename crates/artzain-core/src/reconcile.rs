@@ -9,6 +9,7 @@
 //! in one place, one tick at a time, so the behavior is easy to reason about
 //! and reproduce.
 
+use crate::lock::Lock;
 use crate::manifest::{App, Manifest};
 use crate::probe;
 use crate::process::{self, Spawn};
@@ -21,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 const TICK: Duration = Duration::from_millis(500);
 const READY_PERIOD: Duration = Duration::from_secs(1);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const CHECK_VERIFY_PERIOD: Duration = Duration::from_secs(10);
 /// Grace between SIGTERM and SIGKILL when stopping an instance.
 const STOP_GRACE: Duration = Duration::from_secs(10);
 /// Rolling-update budget: at most this many of an app's replicas may be
@@ -44,13 +46,19 @@ pub async fn up(manifest_path: &Path, opts: UpOptions) -> anyhow::Result<()> {
         anyhow::bail!("no apps to run");
     }
 
+    // Take the lock early so two `up` runs can't clobber the same state file.
+    let _lock = Lock::acquire(&manifest.base_dir)?;
+
     // Verify external dependencies once, up front — fail fast with the hint
     // rather than crash-looping an app against a Postgres that isn't up.
-    verify_checks(&manifest, &selected).await?;
+    let checks_ok = verify_checks(&manifest, &selected).await?;
 
-    let mut r = Reconciler::new(manifest, manifest_path.to_path_buf(), selected);
+    let mut r = Reconciler::new(manifest, manifest_path.to_path_buf(), selected, checks_ok);
     r.write_state();
-    tracing::info!(apps = r.selected.len(), "artzain up — reconciling; Ctrl-C to stop");
+    tracing::info!(
+        apps = r.selected.len(),
+        "artzain up — reconciling; Ctrl-C to stop"
+    );
 
     loop {
         tokio::select! {
@@ -135,14 +143,26 @@ struct Reconciler {
     selected: HashSet<String>,
     instances: Vec<Instance>,
     state_path: PathBuf,
+    /// Current port assigned to each desired slot `(app, replica)`. Initially
+    /// `app.port + replica`; updated during rolling updates when a new
+    /// instance is launched on a temporary surge port.
+    slot_ports: BTreeMap<(String, u32), u16>,
+    /// Current liveness of every `[[check]]` in the manifest. Re-verified
+    /// periodically while the cluster is running so apps can be gated on deps
+    /// that come and go.
+    checks_ok: BTreeMap<String, bool>,
+    /// When to re-verify checks next.
+    next_check_verify: Instant,
 }
 
 impl Reconciler {
-    fn new(manifest: Manifest, manifest_path: PathBuf, selected: HashSet<String>) -> Self {
-        let state_path = manifest
-            .base_dir
-            .join(".artzain")
-            .join("state.json");
+    fn new(
+        manifest: Manifest,
+        manifest_path: PathBuf,
+        selected: HashSet<String>,
+        checks_ok: BTreeMap<String, bool>,
+    ) -> Self {
+        let state_path = manifest.base_dir.join(".artzain").join("state.json");
         let mtime = file_mtime(&manifest_path);
         Self {
             manifest,
@@ -152,6 +172,9 @@ impl Reconciler {
             selected,
             instances: Vec::new(),
             state_path,
+            slot_ports: BTreeMap::new(),
+            checks_ok,
+            next_check_verify: Instant::now() + CHECK_VERIFY_PERIOD,
         }
     }
 
@@ -176,17 +199,16 @@ impl Reconciler {
         self.pending_mtime = None;
         self.manifest_mtime = current;
 
-        let reloaded = Manifest::load(&self.manifest_path)
-            .and_then(|m| {
-                if m.apps.is_empty() {
-                    anyhow::bail!("no apps (empty or partial file?)");
-                }
-                let selected = select_apps(&m, self.only_names().as_deref())?;
-                if selected.is_empty() {
-                    anyhow::bail!("selection is empty");
-                }
-                Ok((m, selected))
-            });
+        let reloaded = Manifest::load(&self.manifest_path).and_then(|m| {
+            if m.apps.is_empty() {
+                anyhow::bail!("no apps (empty or partial file?)");
+            }
+            let selected = select_apps(&m, self.only_names().as_deref())?;
+            if selected.is_empty() {
+                anyhow::bail!("selection is empty");
+            }
+            Ok((m, selected))
+        });
         match reloaded {
             Ok((m, selected)) => {
                 tracing::info!("manifest changed — reconciling to new desired state");
@@ -211,12 +233,76 @@ impl Reconciler {
         }
     }
 
+    /// Re-verify `[[check]]` entries periodically. If a check flips from ok to
+    /// not-ok, dependents will be stopped on the next tick; when it recovers,
+    /// `spawn_missing` will restart them.
+    async fn reverify_checks(&mut self) {
+        let now = Instant::now();
+        if now < self.next_check_verify {
+            return;
+        }
+        self.next_check_verify = now + CHECK_VERIFY_PERIOD;
+
+        for check in &self.manifest.checks {
+            let ok = match (&check.tcp, &check.http) {
+                (Some(addr), _) => probe::tcp_once(addr).await,
+                (None, Some(hostpath)) => {
+                    let (addr, path) = split_host_path(hostpath);
+                    probe::http_once(addr, path, Duration::from_secs(2)).await
+                }
+                (None, None) => continue,
+            };
+            let was = self.checks_ok.get(&check.name).copied().unwrap_or(true);
+            if ok && !was {
+                tracing::info!(check = %check.name, "recovered");
+            } else if !ok && was {
+                tracing::warn!(check = %check.name, "failed");
+            }
+            self.checks_ok.insert(check.name.clone(), ok);
+        }
+    }
+
+    /// Stop running instances whose app depends on a check that is currently
+    /// failing. They will be held in Pending/CrashLoopBackOff until the check
+    /// recovers and `spawn_missing` restarts them.
+    fn stop_check_blocked(&mut self) {
+        for idx in 0..self.instances.len() {
+            let (app_name, replica, blocked) = {
+                let inst = &self.instances[idx];
+                let blocked = self
+                    .manifest
+                    .app(&inst.app)
+                    .map(|a| {
+                        a.depends_on.iter().any(|d| {
+                            // App deps are handled elsewhere; only stop for
+                            // failing checks.
+                            self.manifest.app(d).is_none()
+                                && self.checks_ok.get(d).copied() == Some(false)
+                        })
+                    })
+                    .unwrap_or(false);
+                (inst.app.clone(), inst.replica, blocked)
+            };
+            if blocked {
+                let inst = &mut self.instances[idx];
+                if inst.is_running() && inst.phase != Phase::Terminating {
+                    tracing::warn!(app = %app_name, replica, "dependency check failed — stopping instance");
+                    begin_stop(inst, true);
+                }
+            }
+        }
+    }
+
     async fn reconcile(&mut self) {
+        self.reverify_checks().await;
         self.reap();
         let desired = self.desired_slots();
         self.terminate_undesired(&desired);
+        self.stop_check_blocked();
         self.roll_stale(&desired);
+        let desired = self.desired_slots();
         self.spawn_missing(&desired);
+        self.retire_stale_surplus(&desired);
         self.probe().await;
     }
 
@@ -288,7 +374,11 @@ impl Reconciler {
                 continue;
             }
             for i in 0..app.replicas {
-                let port = app.port + i as u16;
+                let port = self
+                    .slot_ports
+                    .get(&(app.name.clone(), i))
+                    .copied()
+                    .unwrap_or_else(|| app.port + i as u16);
                 let hash = spec_hash(&self.manifest, app, i, port);
                 out.insert((app.name.clone(), i), (port, hash));
             }
@@ -297,12 +387,22 @@ impl Reconciler {
     }
 
     /// Stop instances that are no longer desired (app removed or scaled down).
+    /// Retires higher replica indices first so the surviving set stays
+    /// contiguous (0, 1, …) rather than leaving a gap.
     fn terminate_undesired(&mut self, desired: &BTreeMap<(String, u32), (u16, u64)>) {
+        // Collect indices first, then sort by descending replica index.
+        let mut indices: Vec<usize> = self
+            .instances
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| !desired.contains_key(&(i.app.clone(), i.replica)))
+            .map(|(idx, _)| idx)
+            .collect();
+        indices.sort_by_key(|&idx| std::cmp::Reverse(self.instances[idx].replica));
+
         let mut remove = Vec::new();
-        for inst in &mut self.instances {
-            if desired.contains_key(&(inst.app.clone(), inst.replica)) {
-                continue;
-            }
+        for idx in indices {
+            let inst = &mut self.instances[idx];
             if inst.is_running() {
                 if inst.phase != Phase::Terminating {
                     begin_stop(inst, false);
@@ -315,9 +415,13 @@ impl Reconciler {
             .retain(|i| !remove.contains(&(i.app.clone(), i.replica)));
     }
 
-    /// Rolling replace: for each app, if it has budget (≤ MAX_UNAVAILABLE
-    /// currently down) and a Ready instance whose spec is stale, stop one so
-    /// it is recreated with the new spec. One at a time keeps the app serving.
+    /// Rolling replace: for each app, retire stale instances. Stale non-Ready
+    /// instances are stopped directly (they are already unavailable). When
+    /// `max_surge == 0`, stale Ready instances are stopped one at a time while
+    /// respecting the maxUnavailable budget. When `max_surge > 0`, a new
+    /// instance is launched on a temporary surge port before the old one is
+    /// stopped, giving a zero-downtime roll at the cost of a temporary port
+    /// change.
     fn roll_stale(&mut self, desired: &BTreeMap<(String, u32), (u16, u64)>) {
         let app_names: Vec<String> = self
             .selected
@@ -328,23 +432,70 @@ impl Reconciler {
             .collect();
 
         for app in app_names {
-            // Availability is measured against *desired*, not just the
-            // instances currently present: a slot that was retired and has
-            // exited (so its Instance is gone) is still unavailable until its
-            // replacement is Ready. Counting only present non-Ready instances
-            // would under-count and let a second replica be retired too early,
-            // breaking the maxUnavailable=1 guarantee.
-            let desired_count = self
-                .manifest
-                .app(&app)
-                .map(|a| a.replicas as usize)
-                .unwrap_or(0);
+            let app_cfg = self.manifest.app(&app);
+            let desired_count = app_cfg.map(|a| a.replicas as usize).unwrap_or(0);
             let ready = self
                 .instances
                 .iter()
                 .filter(|i| i.app == app && i.phase == Phase::Ready)
                 .count();
             let unavailable = desired_count.saturating_sub(ready);
+            let max_surge = self.manifest.defaults.max_surge as usize;
+            let total = self.instances.iter().filter(|i| i.app == app).count();
+            let surge_budget = desired_count + max_surge;
+
+            // Any stale non-Ready instance can be rolled directly: it is
+            // already unavailable, so replacing it cannot make things worse.
+            let non_ready_target = self.instances.iter_mut().find(|i| {
+                i.app == app
+                    && i.phase != Phase::Ready
+                    && i.phase != Phase::Terminating
+                    && desired
+                        .get(&(i.app.clone(), i.replica))
+                        .map(|(_, h)| *h != i.spec_hash)
+                        .unwrap_or(false)
+            });
+            if let Some(inst) = non_ready_target {
+                tracing::info!(app = %inst.app, replica = inst.replica, phase = ?inst.phase, "rolling: retiring stale non-ready instance");
+                begin_stop(inst, false);
+                continue;
+            }
+
+            if max_surge > 0 {
+                // Surge strategy: keep the old Ready instance running while we
+                // start a new one on a temporary port. Once the new one is
+                // Ready, retire_stale_surplus() will stop the old one.
+                let stale_ready = self.instances.iter().find(|i| {
+                    i.app == app
+                        && i.phase == Phase::Ready
+                        && desired
+                            .get(&(i.app.clone(), i.replica))
+                            .map(|(_, h)| *h != i.spec_hash)
+                            .unwrap_or(false)
+                });
+                if let Some(stale) = stale_ready {
+                    let slot_key = (stale.app.clone(), stale.replica);
+                    let current_hash = desired.get(&slot_key).map(|(_, h)| *h).unwrap_or(0);
+                    let has_new_for_slot = self.instances.iter().any(|i| {
+                        i.app == stale.app
+                            && i.replica == stale.replica
+                            && i.spec_hash == current_hash
+                    });
+                    if !has_new_for_slot && total < surge_budget {
+                        let surge_port = surge_port_for(&self.manifest, app_cfg.unwrap());
+                        self.slot_ports.insert(slot_key.clone(), surge_port);
+                        tracing::info!(
+                            app = %stale.app,
+                            replica = stale.replica,
+                            old_port = stale.port,
+                            new_port = surge_port,
+                            "rolling: allocating surge port for stale instance"
+                        );
+                    }
+                }
+                continue;
+            }
+
             if unavailable >= MAX_UNAVAILABLE {
                 continue;
             }
@@ -358,9 +509,50 @@ impl Reconciler {
                         .unwrap_or(false)
             });
             if let Some(inst) = target {
-                tracing::info!(app = %inst.app, replica = inst.replica, "rolling: retiring stale instance");
+                tracing::info!(app = %inst.app, replica = inst.replica, "rolling: retiring stale ready instance");
                 begin_stop(inst, false); // dropped on exit, recreated with new spec
             }
+        }
+    }
+
+    /// When maxSurge is enabled, a slot may temporarily have both an old and a
+    /// new instance. Once the new instance is Ready, stop the old one.
+    fn retire_stale_surplus(&mut self, desired: &BTreeMap<(String, u32), (u16, u64)>) {
+        if self.manifest.defaults.max_surge == 0 {
+            return;
+        }
+        let mut to_stop = Vec::new();
+        for ((app, replica), (_, current_hash)) in desired {
+            let slot_instances: Vec<_> = self
+                .instances
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| &i.app == app && i.replica == *replica)
+                .collect();
+            if slot_instances.len() <= 1 {
+                continue;
+            }
+            let has_new_ready = slot_instances
+                .iter()
+                .any(|(_, i)| i.spec_hash == *current_hash && i.phase == Phase::Ready);
+            if !has_new_ready {
+                continue;
+            }
+            for (idx, i) in slot_instances {
+                if i.spec_hash != *current_hash && i.phase != Phase::Terminating {
+                    to_stop.push(idx);
+                }
+            }
+        }
+        for idx in to_stop {
+            let inst = &mut self.instances[idx];
+            tracing::info!(
+                app = %inst.app,
+                replica = inst.replica,
+                port = inst.port,
+                "rolling: retiring stale instance after surge replacement is ready"
+            );
+            begin_stop(inst, false);
         }
     }
 
@@ -369,11 +561,11 @@ impl Reconciler {
     /// dependencies are Ready.
     fn spawn_missing(&mut self, desired: &BTreeMap<(String, u32), (u16, u64)>) {
         for ((app, replica), (port, hash)) in desired {
-            if !self
+            let has_current = self
                 .instances
                 .iter()
-                .any(|i| &i.app == app && i.replica == *replica)
-            {
+                .any(|i| &i.app == app && i.replica == *replica && i.spec_hash == *hash);
+            if !has_current {
                 self.instances
                     .push(Instance::pending(app, *replica, *port, *hash));
             }
@@ -400,13 +592,23 @@ impl Reconciler {
                     .app(&inst.app)
                     .map(|a| {
                         a.depends_on.iter().all(|d| {
-                            // App deps must be Ready; check deps were verified
-                            // up front so they don't gate here.
-                            self.manifest.app(d).is_none() || ready_apps.contains(d)
+                            if self.manifest.app(d).is_some() {
+                                // App deps must be Ready.
+                                ready_apps.contains(d)
+                            } else {
+                                // Check deps must currently be ok.
+                                self.checks_ok.get(d).copied().unwrap_or(true)
+                            }
                         })
                     })
                     .unwrap_or(false);
-                (inst.app.clone(), inst.replica, inst.port, backoff_ok, deps_ok)
+                (
+                    inst.app.clone(),
+                    inst.replica,
+                    inst.port,
+                    backoff_ok,
+                    deps_ok,
+                )
             };
             if !backoff_ok || !deps_ok {
                 continue;
@@ -419,7 +621,9 @@ impl Reconciler {
         let Some(app) = self.manifest.app(app_name).cloned() else {
             return;
         };
-        let cwd = self.manifest.resolve(app.dir.as_deref().unwrap_or(Path::new(".")));
+        let cwd = self
+            .manifest
+            .resolve(app.dir.as_deref().unwrap_or(Path::new(".")));
         let bin = self.manifest.resolve(&app.bin);
         let env = instance_env(&self.manifest, &app, replica, port);
 
@@ -427,6 +631,12 @@ impl Reconciler {
             tracing::warn!(app = %app_name, port, "port already in use — spawn may fail to bind");
         }
 
+        let log_path = self
+            .manifest
+            .base_dir
+            .join(".artzain")
+            .join("logs")
+            .join(format!("{}-{}.log", app_name, replica));
         let spawn = Spawn {
             app: app_name,
             replica,
@@ -434,6 +644,7 @@ impl Reconciler {
             args: &app.args,
             cwd: &cwd,
             env: &env,
+            log_path: Some(log_path),
         };
         match process::spawn(&spawn) {
             Ok(handle) => {
@@ -595,17 +806,19 @@ impl Reconciler {
         let now = Instant::now();
         let mut apps: BTreeMap<String, Vec<InstanceStatus>> = BTreeMap::new();
         for inst in &self.instances {
-            apps.entry(inst.app.clone()).or_default().push(InstanceStatus {
-                replica: inst.replica,
-                port: inst.port,
-                phase: inst.phase,
-                pid: inst.handle.as_ref().and_then(|h| h.child.id()),
-                restarts: inst.restarts,
-                uptime_secs: inst
-                    .started_at
-                    .map(|t| now.duration_since(t).as_secs())
-                    .unwrap_or(0),
-            });
+            apps.entry(inst.app.clone())
+                .or_default()
+                .push(InstanceStatus {
+                    replica: inst.replica,
+                    port: inst.port,
+                    phase: inst.phase,
+                    pid: inst.handle.as_ref().and_then(|h| h.child.id()),
+                    restarts: inst.restarts,
+                    uptime_secs: inst
+                        .started_at
+                        .map(|t| now.duration_since(t).as_secs())
+                        .unwrap_or(0),
+                });
         }
         let app_status = self
             .manifest
@@ -635,10 +848,46 @@ impl Reconciler {
     fn write_state(&self) {
         let state = self.snapshot();
         if let Some(dir) = self.state_path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::error!(
+                    path = %self.state_path.display(),
+                    error = %e,
+                    "could not create state directory"
+                );
+                return;
+            }
         }
-        let _ = std::fs::write(&self.state_path, state.to_json());
+        if let Err(e) = std::fs::write(&self.state_path, state.to_json()) {
+            tracing::error!(
+                path = %self.state_path.display(),
+                error = %e,
+                "could not write state file"
+            );
+        }
     }
+}
+
+/// Find a port outside the declared ranges of every app in the manifest, to
+/// use as a temporary surge port during a rolling update. If every port above
+/// the app's range is taken, this falls back to a likely-colliding port; the
+/// bind failure will be handled like any other spawn failure.
+fn surge_port_for(manifest: &Manifest, app: &App) -> u16 {
+    let claimed: HashSet<u16> = manifest
+        .apps
+        .iter()
+        .flat_map(|a| (0..a.replicas).map(move |i| a.port + i as u16))
+        .collect();
+    let base = app.port as u32 + app.replicas;
+    let mut candidate = base;
+    while candidate <= u16::MAX as u32 {
+        let p = candidate as u16;
+        if !claimed.contains(&p) {
+            return p;
+        }
+        candidate += 1;
+    }
+    // Overflow fallback: use the base even if it collides.
+    base as u16
 }
 
 /// SIGTERM an instance and mark it terminating. `respawn` decides the fate
@@ -703,7 +952,10 @@ fn spec_hash(manifest: &Manifest, app: &App, replica: u32, port: u16) -> u64 {
 }
 
 /// Selected apps plus their transitive app dependencies. `None` selects all.
-fn select_apps(manifest: &Manifest, only: Option<&[String]>) -> anyhow::Result<HashSet<String>> {
+pub fn select_apps(
+    manifest: &Manifest,
+    only: Option<&[String]>,
+) -> anyhow::Result<HashSet<String>> {
     let by_name: BTreeMap<&str, &App> =
         manifest.apps.iter().map(|a| (a.name.as_str(), a)).collect();
     let Some(only) = only else {
@@ -733,9 +985,14 @@ fn select_apps(manifest: &Manifest, only: Option<&[String]>) -> anyhow::Result<H
 }
 
 /// Verify every `[[check]]` reachable from a selected app (and any check with
-/// no dependents too — a bare check in the manifest is an assertion). Fails
-/// with the hint if anything is down.
-async fn verify_checks(manifest: &Manifest, _selected: &HashSet<String>) -> anyhow::Result<()> {
+/// no dependents too — a bare check in the manifest is an assertion). Returns a
+/// map of check name -> ok status. Fails with the hint if anything is down on
+/// the first check.
+async fn verify_checks(
+    manifest: &Manifest,
+    _selected: &HashSet<String>,
+) -> anyhow::Result<BTreeMap<String, bool>> {
+    let mut out = BTreeMap::new();
     let mut failures = Vec::new();
     for check in &manifest.checks {
         let ok = match (&check.tcp, &check.http) {
@@ -746,6 +1003,7 @@ async fn verify_checks(manifest: &Manifest, _selected: &HashSet<String>) -> anyh
             }
             (None, None) => unreachable!("validated at load"),
         };
+        out.insert(check.name.clone(), ok);
         if ok {
             tracing::info!(check = %check.name, "ok");
         } else {
@@ -756,12 +1014,9 @@ async fn verify_checks(manifest: &Manifest, _selected: &HashSet<String>) -> anyh
         }
     }
     if failures.is_empty() {
-        Ok(())
+        Ok(out)
     } else {
-        anyhow::bail!(
-            "dependency checks failed:\n  - {}",
-            failures.join("\n  - ")
-        )
+        anyhow::bail!("dependency checks failed:\n  - {}", failures.join("\n  - "))
     }
 }
 
@@ -793,7 +1048,10 @@ mod tests {
         assert_eq!(backoff_delay(500, 30_000, 2), Duration::from_millis(1000));
         assert_eq!(backoff_delay(500, 30_000, 3), Duration::from_millis(2000));
         // Caps out.
-        assert_eq!(backoff_delay(500, 30_000, 20), Duration::from_millis(30_000));
+        assert_eq!(
+            backoff_delay(500, 30_000, 20),
+            Duration::from_millis(30_000)
+        );
     }
 
     #[test]
@@ -825,7 +1083,10 @@ args = ["--flag"]
         )
         .unwrap();
         // args changed -> stale
-        assert_ne!(spec_hash(&m, a, 0, 8080), spec_hash(&m2, &m2.apps[0], 0, 8080));
+        assert_ne!(
+            spec_hash(&m, a, 0, 8080),
+            spec_hash(&m2, &m2.apps[0], 0, 8080)
+        );
     }
 
     #[test]
@@ -859,7 +1120,34 @@ port = 7000
 
     #[test]
     fn split_host_path_splits_on_first_slash() {
-        assert_eq!(split_host_path("127.0.0.1:8080/health"), ("127.0.0.1:8080", "/health"));
+        assert_eq!(
+            split_host_path("127.0.0.1:8080/health"),
+            ("127.0.0.1:8080", "/health")
+        );
         assert_eq!(split_host_path("127.0.0.1:8080"), ("127.0.0.1:8080", "/"));
+    }
+
+    #[test]
+    fn surge_port_is_outside_declared_ranges() {
+        let m = Manifest::parse(
+            r#"
+[[app]]
+name = "a"
+bin = "./a"
+port = 8080
+replicas = 2
+
+[[app]]
+name = "b"
+bin = "./b"
+port = 8082
+"#,
+            Path::new("artzain.toml"),
+        )
+        .unwrap();
+        let a = m.app("a").unwrap();
+        let surge = surge_port_for(&m, a);
+        // 8080 and 8081 are claimed by `a`; 8082 by `b`. Surge must be 8083 or higher.
+        assert!(surge >= 8083);
     }
 }

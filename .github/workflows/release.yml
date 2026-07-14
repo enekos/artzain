@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p artzain
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME:-dev}"
+          mkdir -p dist
+          cp target/release/artzain dist/
+          cp README.md dist/
+          cd dist
+          tar czf "../artzain-${version}-x86_64-unknown-linux-gnu.tar.gz" artzain README.md
+          sha256sum artzain > "../artzain-${version}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: artzain-${{ github.ref_name }}-x86_64-unknown-linux-gnu
+          path: |
+            dist/
+            artzain-*.tar.gz
+            artzain-*.tar.gz.sha256
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artzain-*.tar.gz
+            artzain-*.tar.gz.sha256

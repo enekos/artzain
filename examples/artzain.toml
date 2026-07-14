@@ -18,6 +18,7 @@ root = "."
 env = { RUST_LOG = "info" }
 restart_backoff_ms = 500
 restart_backoff_max_ms = 30000
+# max_surge = 1  # uncomment for zero-downtime rolling updates on a temporary port
 
 # External dependency artzain verifies before starting apps (but does not
 # manage). An app can `depends_on` it to defer its own start.

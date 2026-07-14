@@ -4,9 +4,10 @@
 //! — the reconciler owns the fleet.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::fs::OpenOptions;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 const PALETTE: &[&str] = &["36", "32", "33", "35", "34", "96", "92", "93", "95", "94"];
@@ -31,6 +32,8 @@ pub struct Spawn<'a> {
     pub args: &'a [String],
     pub cwd: &'a Path,
     pub env: &'a BTreeMap<String, String>,
+    /// If set, stdout and stderr are also appended to this file.
+    pub log_path: Option<PathBuf>,
 }
 
 /// A live child plus the bookkeeping needed to signal and label it.
@@ -66,7 +69,12 @@ pub fn spawn(s: &Spawn) -> anyhow::Result<Handle> {
         )
     })?;
     let pgid = child.id().map(|pid| pid as i32).unwrap_or(0);
-    stream_logs(&tag, child.stdout.take(), child.stderr.take());
+    stream_logs(
+        &tag,
+        child.stdout.take(),
+        child.stderr.take(),
+        s.log_path.clone(),
+    );
     Ok(Handle { child, pgid })
 }
 
@@ -112,23 +120,57 @@ fn stream_logs(
     tag: &str,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
+    log_path: Option<PathBuf>,
 ) {
     if let Some(out) = stdout {
         let tag = tag.to_string();
+        let log_path = log_path.clone();
         tokio::spawn(async move {
+            let mut file = open_log_file(log_path.as_deref()).await;
             let mut lines = BufReader::new(out).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 println!("{tag} {line}");
+                if let Some(f) = file.as_mut() {
+                    let _ = f.write_all(line.as_bytes()).await;
+                    let _ = f.write_all(b"\n").await;
+                }
             }
         });
     }
     if let Some(err) = stderr {
         let tag = tag.to_string();
         tokio::spawn(async move {
+            let mut file = open_log_file(log_path.as_deref()).await;
             let mut lines = BufReader::new(err).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 eprintln!("{tag} {line}");
+                if let Some(f) = file.as_mut() {
+                    let _ = f.write_all(line.as_bytes()).await;
+                    let _ = f.write_all(b"\n").await;
+                }
             }
         });
+    }
+}
+
+async fn open_log_file(path: Option<&Path>) -> Option<tokio::fs::File> {
+    let path = path?;
+    if let Some(dir) = path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(dir).await {
+            tracing::warn!(dir = %dir.display(), error = %e, "could not create log directory");
+            return None;
+        }
+    }
+    match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "could not open log file");
+            None
+        }
     }
 }

@@ -10,6 +10,7 @@
 //! gracefully on Ctrl-C. No git, no Docker, no daemon — a file is the whole
 //! control plane.
 
+pub mod lock;
 pub mod manifest;
 mod probe;
 mod process;
@@ -20,16 +21,16 @@ pub use manifest::Manifest;
 pub use reconcile::{up, UpOptions};
 pub use state::{AppStatus, ClusterState, InstanceStatus, Phase};
 
+use crate::reconcile::select_apps;
 use std::path::Path;
 
-/// Default manifest filename looked up in the current directory.
 pub const DEFAULT_MANIFEST: &str = "artzain.toml";
 
 /// Validate a manifest and print the startup plan without touching any
 /// process — the `--dry-run` / `plan` surface.
 pub fn plan(manifest_path: &Path, only: Option<&[String]>) -> anyhow::Result<()> {
     let manifest = Manifest::load(manifest_path)?;
-    let selected = reconcile_select(&manifest, only)?;
+    let selected = select_apps(&manifest, only)?;
     println!("project: {}", manifest.project());
     for check in &manifest.checks {
         let target = check
@@ -73,42 +74,6 @@ pub fn read_status(manifest_path: &Path) -> anyhow::Result<ClusterState> {
         )
     })?;
     ClusterState::from_json(&raw)
-}
-
-// `select_apps` lives in the reconcile module; re-derive the same selection
-// for `plan` without exposing the internal helper.
-fn reconcile_select(
-    manifest: &Manifest,
-    only: Option<&[String]>,
-) -> anyhow::Result<std::collections::HashSet<String>> {
-    let all: std::collections::HashSet<String> =
-        manifest.apps.iter().map(|a| a.name.clone()).collect();
-    let Some(only) = only else {
-        return Ok(all);
-    };
-    let mut selected = std::collections::HashSet::new();
-    let by_name: std::collections::BTreeMap<&str, &manifest::App> =
-        manifest.apps.iter().map(|a| (a.name.as_str(), a)).collect();
-    let mut queue: Vec<String> = Vec::new();
-    for n in only {
-        if !by_name.contains_key(n.as_str()) {
-            anyhow::bail!("--only: unknown app `{n}`");
-        }
-        queue.push(n.clone());
-    }
-    while let Some(n) = queue.pop() {
-        if !selected.insert(n.clone()) {
-            continue;
-        }
-        if let Some(a) = by_name.get(n.as_str()) {
-            for d in &a.depends_on {
-                if by_name.contains_key(d.as_str()) {
-                    queue.push(d.clone());
-                }
-            }
-        }
-    }
-    Ok(selected)
 }
 
 /// Completes on any signal meaning "shut down": SIGINT (Ctrl-C), SIGTERM, or

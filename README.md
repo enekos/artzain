@@ -62,7 +62,8 @@ $ artzain down            # stop the running cluster
 | `artzain up [--only a,b] [--no-watch]` | Reconcile the manifest and supervise it (foreground). |
 | `artzain plan [--only a,b]` | Validate the manifest and print what `up` would do. |
 | `artzain status` | Print the state of a running cluster. |
-| `artzain down` | Signal a running cluster to shut down. |
+| `artzain logs [app]` | Print persisted logs from the running cluster. |
+| `artzain down [--force]` | Signal a running cluster to shut down. `--force` skips the lock-file safety check. |
 
 `-f/--file` points at a manifest other than `./artzain.toml`.
 
@@ -76,21 +77,29 @@ $ artzain down            # stop the running cluster
 | livenessProbe | `live_path`; `live_failures` consecutive fails → restart |
 | restartPolicy: Always + CrashLoopBackOff | exponential backoff, reset after `stable_after_secs` uptime |
 | RollingUpdate (maxUnavailable=1) | edit the manifest → stale instances replaced one at a time |
+| RollingUpdate (maxSurge=1) | set `[defaults].max_surge = 1`; new instance starts on a temp port before the old one stops |
 | `kubectl apply` | save the manifest file — `up` watches and reconciles |
 | `kubectl get pods` | `artzain status` |
+| `kubectl logs` | `artzain logs` |
 
 ### Reconcile loop, per tick (500ms)
 
 1. **Reload** the manifest if it changed on disk (debounced one tick, and a
    parse error or a zero-app file is rejected — a half-written file never takes
    the fleet down).
-2. **Reap** exited children; crashes get exponential backoff.
-3. **Terminate** instances no longer desired (scale-down, app removed).
-4. **Roll** stale instances (spec changed) one per app, respecting
-   maxUnavailable measured against desired replicas.
-5. **Spawn** missing/backed-off slots whose app dependencies are `Ready`.
-6. **Probe** readiness and liveness.
-7. **Write** the state snapshot.
+2. **Re-verify** `[[check]]` entries every 10s; apps whose check deps fail are
+   stopped and held until the check recovers.
+3. **Reap** exited children; crashes get exponential backoff.
+4. **Terminate** instances no longer desired (scale-down, app removed); higher
+   replica indices retire first.
+5. **Roll** stale instances (spec changed) one per app, respecting
+   maxUnavailable; non-Ready stale instances are also rolled immediately. With
+   `max_surge > 0`, new instances start on a temporary surge port before the
+   old one is stopped.
+6. **Spawn** missing/backed-off slots whose app dependencies are `Ready` and
+   whose checks are still passing.
+7. **Probe** readiness and liveness.
+8. **Write** the state snapshot.
 
 ## Manifest reference
 
@@ -98,13 +107,14 @@ $ artzain down            # stop the running cluster
 project = "demo"                       # cosmetic label
 
 [vars]                                 # ${name} interpolation; ARTZAIN_VAR_<NAME> overrides
-root = "/srv/app"
+root = "/srv/app"                      # use $$ for a literal $, e.g. "$${name}" or "$$HOME"
 
 [defaults]
 env = { RUST_LOG = "info" }            # merged into every app (app env wins)
 restart_backoff_ms = 500               # base crash backoff (doubles each crash)
 restart_backoff_max_ms = 30000         # backoff cap
 stable_after_secs = 10                 # uptime that resets the crash counter
+max_surge = 0                          # 0 = replace one-for-one; 1 = zero-downtime on temp port
 
 [[check]]                              # external dep, verified once before apps start
 name = "postgres"
@@ -131,6 +141,10 @@ live_failures = 3                      # consecutive liveness fails that restart
 
 - `crates/artzain-core` — manifest, probes, process control, reconcile loop, state.
 - `crates/artzain` — the CLI.
+
+## Releases
+
+Prebuilt Linux x86_64 binaries are attached to [GitHub releases](https://github.com/enekos/artzain/releases). The `Release` workflow (`.github/workflows/release.yml`) builds `artzain` on every `v*.*.*` tag and publishes `artzain-<version>-x86_64-unknown-linux-gnu.tar.gz`.
 
 ## License
 

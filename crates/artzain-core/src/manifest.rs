@@ -53,6 +53,11 @@ pub struct Defaults {
     /// long-lived process that dies once doesn't inherit an old backoff.
     #[serde(default = "default_stable_secs")]
     pub stable_after_secs: u64,
+    /// Maximum extra instances allowed above `replicas` during a rolling
+    /// update. `0` means replace one-for-one (maxSurge=0); `1` starts the new
+    /// instance on a temporary port before stopping the old one.
+    #[serde(default)]
+    pub max_surge: u32,
 }
 
 fn default_backoff_ms() -> u64 {
@@ -283,8 +288,9 @@ impl Manifest {
 }
 
 /// Substitute `${name}` for every entry of the manifest's `[vars]` table (an
-/// `ARTZAIN_VAR_<NAME>` env var overrides the file value). Unknown `${...}`
-/// references are errors — typos should not silently parse.
+/// `ARTZAIN_VAR_<NAME>` env var overrides the file value). `$$` escapes a
+/// literal `$`, so values like `$$HOME` or `$${foo}` are preserved. Unknown
+/// `${...}` references are errors — typos should not silently parse.
 fn interpolate_vars(raw: &str, path: &Path) -> anyhow::Result<String> {
     #[derive(Deserialize)]
     struct VarsOnly {
@@ -301,9 +307,23 @@ fn interpolate_vars(raw: &str, path: &Path) -> anyhow::Result<String> {
     };
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
-    while let Some(start) = rest.find("${") {
+    while let Some(start) = rest.find('$') {
         out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
+        let after = &rest[start + 1..];
+        if let Some(stripped) = after.strip_prefix('$') {
+            // Escaped literal '$'.
+            out.push('$');
+            rest = stripped;
+            continue;
+        }
+        if !after.starts_with('{') {
+            // Bare '$' that is not an escape or interpolation — keep it.
+            out.push('$');
+            rest = after;
+            continue;
+        }
+        // '${...}' interpolation.
+        let after = &after[1..];
         let Some(end) = after.find('}') else {
             anyhow::bail!("{}: unterminated ${{...}} reference", path.display());
         };
@@ -401,7 +421,12 @@ port = 8080
 "#,
         )
         .unwrap();
-        let order: Vec<_> = m.apps_ordered().unwrap().iter().map(|a| a.name.clone()).collect();
+        let order: Vec<_> = m
+            .apps_ordered()
+            .unwrap()
+            .iter()
+            .map(|a| a.name.clone())
+            .collect();
         assert_eq!(order, vec!["data", "gateway"]);
     }
 
@@ -448,7 +473,7 @@ depends_on = ["postgres"]
     }
 
     #[test]
-    fn var_interpolation_and_unknown_error() {
+    fn var_interpolation_escapes_dollar_dollar() {
         let m = parse(
             r#"
 [vars]
@@ -456,22 +481,41 @@ root = "/srv/app"
 
 [[app]]
 name = "data"
-bin = "${root}/data"
+bin = "$${root}/data"
 port = 8080
 "#,
         )
         .unwrap();
-        assert_eq!(m.apps[0].bin, PathBuf::from("/srv/app/data"));
+        // $$ becomes a literal $, so the bin is "${root}/data", not "/srv/app/data".
+        assert_eq!(m.apps[0].bin, PathBuf::from("${root}/data"));
 
-        let err = parse(
+        // Mixed interpolation and escaping.
+        let m2 = parse(
             r#"
+[vars]
+root = "/srv/app"
+
 [[app]]
-name = "x"
-bin = "${nope}/x"
+name = "data"
+bin = "${root}/data-$$HOME"
 port = 8080
 "#,
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("unknown variable"));
+        .unwrap();
+        assert_eq!(m2.apps[0].bin, PathBuf::from("/srv/app/data-$HOME"));
+    }
+
+    #[test]
+    fn bare_dollar_is_preserved() {
+        let m = parse(
+            r#"
+[[app]]
+name = "x"
+bin = "./$x"
+port = 8080
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.apps[0].bin, PathBuf::from("./$x"));
     }
 }

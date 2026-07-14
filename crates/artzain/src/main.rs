@@ -1,17 +1,22 @@
 //! artzain CLI. Verbs mirror the mental model, not a daemon protocol:
 //!
 //!   artzain up      run the reconcile loop (foreground; Ctrl-C stops)
-//!   artzain plan    validate the manifest and print the startup plan
+//!   artzain plan    validate the manifest and print what `up` would do
 //!   artzain status  print the state of a running cluster
+//!   artzain logs    print persisted logs from a running cluster
 //!   artzain down    stop a running cluster
 
 use std::path::PathBuf;
 
-use artzain_core::{plan, read_status, up, UpOptions, DEFAULT_MANIFEST};
+use artzain_core::{lock::Lock, plan, read_status, up, UpOptions, DEFAULT_MANIFEST};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "artzain", version, about = "A tiny k8s-shaped orchestrator for prebuilt binaries")]
+#[command(
+    name = "artzain",
+    version,
+    about = "A tiny k8s-shaped orchestrator for prebuilt binaries"
+)]
 struct Cli {
     /// Path to the manifest (default: ./artzain.toml).
     #[arg(short = 'f', long, global = true, default_value = DEFAULT_MANIFEST)]
@@ -39,15 +44,23 @@ enum Command {
     },
     /// Print the state of the running cluster (reads the state file).
     Status,
+    /// Print persisted logs from the running cluster.
+    Logs {
+        /// Only logs for this app (default: all apps).
+        app: Option<String>,
+    },
     /// Signal a running cluster to shut down.
-    Down,
+    Down {
+        /// Skip the lock-file safety check and signal the owner pid anyway.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_target(false)
         .init();
@@ -63,7 +76,8 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Plan { only } => plan(&cli.file, only.as_deref()),
         Command::Status => print_status(&cli.file),
-        Command::Down => down(&cli.file),
+        Command::Logs { app } => print_logs(&cli.file, app.as_deref()),
+        Command::Down { force } => down(&cli.file, force),
     }
 }
 
@@ -82,7 +96,10 @@ fn print_status(file: &std::path::Path) -> anyhow::Result<()> {
         state.owner_pid,
         now_unix().saturating_sub(state.updated_at),
     );
-    println!("{:<16} {:<8} {:<7} {:<6} {:<8} RESTARTS", "APP", "READY", "REPLICA", "PORT", "PHASE");
+    println!(
+        "{:<16} {:<8} {:<7} {:<6} {:<8} RESTARTS",
+        "APP", "READY", "REPLICA", "PORT", "PHASE"
+    );
     for app in &state.apps {
         for inst in &app.instances {
             println!(
@@ -97,15 +114,87 @@ fn print_status(file: &std::path::Path) -> anyhow::Result<()> {
             );
         }
         if app.instances.is_empty() {
-            println!("{:<16} {:<8} (no instances)", app.name, format!("{}/{}", app.ready, app.desired));
+            println!(
+                "{:<16} {:<8} (no instances)",
+                app.name,
+                format!("{}/{}", app.ready, app.desired)
+            );
         }
     }
     Ok(())
 }
 
-fn down(file: &std::path::Path) -> anyhow::Result<()> {
+fn print_logs(file: &std::path::Path, app: Option<&str>) -> anyhow::Result<()> {
+    let base_dir = file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let log_dir = base_dir.join(".artzain").join("logs");
+    if !log_dir.exists() {
+        anyhow::bail!("no log directory found — is a cluster running?");
+    }
+
+    let mut entries: Vec<_> = std::fs::read_dir(&log_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.path())
+        .filter(|p| {
+            if let Some(app) = app {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.starts_with(app))
+                    .unwrap_or(false)
+            } else {
+                true
+            }
+        })
+        .collect();
+    entries.sort();
+
+    if entries.is_empty() {
+        println!("no log files found");
+        return Ok(());
+    }
+
+    for path in entries {
+        println!(
+            "--- {}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        match std::fs::read_to_string(&path) {
+            Ok(text) => print!("{}", text),
+            Err(e) => eprintln!("could not read {}: {e}", path.display()),
+        }
+    }
+    Ok(())
+}
+
+fn down(file: &std::path::Path, force: bool) -> anyhow::Result<()> {
     let state = read_status(file)?;
     let pid = state.owner_pid as i32;
+
+    if !force {
+        // Verify the lock file points to the same live pid before sending SIGTERM.
+        // This avoids killing an unrelated process that reused a stale pid.
+        let base_dir = file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        match Lock::read(&base_dir)? {
+            Some(lock) if lock.pid == state.owner_pid => {
+                if !is_pid_alive(pid) {
+                    anyhow::bail!(
+                        "cluster owner pid {pid} is not running; the cluster may already be down (use --force to override)"
+                    );
+                }
+            }
+            Some(_) => anyhow::bail!("lock file does not match state owner pid — refusing to signal an unrelated process (use --force to override)"),
+            None => anyhow::bail!("no lock file found; the cluster may already be down (use --force to override)"),
+        }
+    }
+
     // SIGTERM the `up` process; its own teardown stops every child group.
     let rc = unsafe { libc_kill(pid, 15) };
     if rc != 0 {
@@ -113,6 +202,20 @@ fn down(file: &std::path::Path) -> anyhow::Result<()> {
     }
     println!("sent SIGTERM to cluster owner pid {pid}");
     Ok(())
+}
+
+#[cfg(unix)]
+fn is_pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: kill(pid, 0) is a pure liveness check.
+    unsafe { libc_kill(pid, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn is_pid_alive(_pid: i32) -> bool {
+    true
 }
 
 // The binary crate avoids a direct libc dep for one call; declare the symbol.
