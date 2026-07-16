@@ -74,6 +74,7 @@ dependencies = [
  "anyhow",
  "artzain-core",
  "clap",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -92,6 +93,14 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "artzain-fixture"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tokio",
 ]
 
 [[package]]

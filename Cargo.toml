@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/artzain-core",
     "crates/artzain",
+    "crates/artzain-fixture",
 ]
 
 [workspace.package]

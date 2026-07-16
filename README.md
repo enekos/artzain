@@ -61,9 +61,10 @@ $ artzain down            # stop the running cluster
 |---|---|
 | `artzain up [--only a,b] [--no-watch]` | Reconcile the manifest and supervise it (foreground). |
 | `artzain plan [--only a,b]` | Validate the manifest and print what `up` would do. |
-| `artzain status` | Print the state of a running cluster. |
-| `artzain logs [app]` | Print persisted logs from the running cluster. |
+| `artzain status [--json] [--check]` | Print the state of a running cluster; `--json` is machine-readable, `--check` exits non-zero when not fully ready. |
+| `artzain logs [app] [--tail N] [--follow]` | Print persisted logs; `--tail` defaults to 200, `--follow` polls rotated files. |
 | `artzain down [--force]` | Signal a running cluster to shut down. `--force` skips the lock-file safety check. |
+| `artzain systemd [--user] [--group] [--manifest] [--binary] [--memory-max] [--install]` | Generate a hardened systemd unit; `--install` writes it to `/etc/systemd/system/artzain@.service`. |
 
 `-f/--file` points at a manifest other than `./artzain.toml`.
 
@@ -111,10 +112,13 @@ root = "/srv/app"                      # use $$ for a literal $, e.g. "$${name}"
 
 [defaults]
 env = { RUST_LOG = "info" }            # merged into every app (app env wins)
+inherit_env = ["AWS_REGION"]           # extra parent-env keys to carry into children (default: none)
 restart_backoff_ms = 500               # base crash backoff (doubles each crash)
 restart_backoff_max_ms = 30000         # backoff cap
 stable_after_secs = 10                 # uptime that resets the crash counter
 max_surge = 0                          # 0 = replace one-for-one; 1 = zero-downtime on temp port
+log_max_bytes = 10485760               # max bytes per log file before rotation (default: 10 MB)
+log_keep = 3                           # number of log files to keep (current + backups, default: 3)
 
 [[check]]                              # external dep, verified once before apps start
 name = "postgres"
@@ -135,12 +139,29 @@ live_path = "/__health"                # HTTP liveness ("" = no liveness probing
 ready_timeout = 60                     # seconds to first-ready before a restart
 live_period = 5                        # seconds between liveness probes
 live_failures = 3                      # consecutive liveness fails that restart
+user = "www-data"                      # drop to this user before exec (Unix only)
+group = "www-data"                     # drop to this group before exec (default: user's primary group)
+limits = { open_files = 65536, memory_mb = 512 }  # per-process rlimits (Unix only)
 ```
+
+**Orphan reclamation.** If a previous `artzain up` died without teardown
+(`kill -9`, OOM, reboot), its child process groups would keep holding ports and
+block the next `up`. On startup `up` checks the stale `state.json`: if the
+recorded owner pid is dead, it SIGTERM→SIGKILLs each recorded process group,
+removes the stale state and lock files, and starts fresh.
+
+**Environment isolation.** Children start with a clean slate: `env_clear()` removes the parent environment, then artzain re-adds a documented base-key set (`PATH`, `HOME`, `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`) plus anything listed in `[defaults].inherit_env`. Manifest env values never appear in the state file or log output.
 
 ## Layout
 
 - `crates/artzain-core` — manifest, probes, process control, reconcile loop, state.
 - `crates/artzain` — the CLI.
+
+## Deployment
+
+For installing artzain as a systemd service on a Linux server — including
+service-account setup, unit install, and reverse-proxy (Caddy/nginx/Apache)
+examples — see [`docs/deployment.md`](docs/deployment.md).
 
 ## Releases
 

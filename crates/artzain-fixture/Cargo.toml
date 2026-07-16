@@ -1,0 +1,13 @@
+[package]
+name = "artzain-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "artzain-fixture"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+libc.workspace = true

@@ -44,6 +44,10 @@ pub struct InstanceStatus {
     pub phase: Phase,
     /// OS pid while running, else `None`.
     pub pid: Option<u32>,
+    /// Process group id while running. Used to reclaim orphans if `up` dies
+    /// without running teardown. `None` for entries written before M2.
+    #[serde(default)]
+    pub pgid: Option<i32>,
     /// How many times this slot has been (re)started since it last stabilised.
     pub restarts: u32,
     /// Seconds the current process has been up (0 when not running).
@@ -60,6 +64,9 @@ pub struct AppStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterState {
+    /// State file schema version. Bumped when new required fields are added.
+    #[serde(default)]
+    pub state_version: u32,
     pub project: String,
     /// pid of the `artzain up` process that owns this fleet.
     pub owner_pid: u32,

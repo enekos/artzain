@@ -12,16 +12,18 @@
 
 pub mod lock;
 pub mod manifest;
+mod paths;
 mod probe;
 mod process;
 mod reconcile;
 mod state;
 
 pub use manifest::Manifest;
-pub use reconcile::{up, UpOptions};
+pub use reconcile::{
+    reclaim_orphans, run_until, select_apps, up, Reconciler, UpOptions, STOP_GRACE,
+};
 pub use state::{AppStatus, ClusterState, InstanceStatus, Phase};
 
-use crate::reconcile::select_apps;
 use std::path::Path;
 
 pub const DEFAULT_MANIFEST: &str = "artzain.toml";

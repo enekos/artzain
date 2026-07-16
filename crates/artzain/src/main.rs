@@ -6,9 +6,12 @@
 //!   artzain logs    print persisted logs from a running cluster
 //!   artzain down    stop a running cluster
 
+mod logs;
+mod systemd;
+
 use std::path::PathBuf;
 
-use artzain_core::{lock::Lock, plan, read_status, up, UpOptions, DEFAULT_MANIFEST};
+use artzain_core::{lock::Lock, plan, read_status, up, UpOptions, DEFAULT_MANIFEST, STOP_GRACE};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -43,11 +46,45 @@ enum Command {
         only: Option<Vec<String>>,
     },
     /// Print the state of the running cluster (reads the state file).
-    Status,
+    Status {
+        /// Output the raw state as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero when any app is not fully ready (ready < desired).
+        #[arg(long)]
+        check: bool,
+    },
     /// Print persisted logs from the running cluster.
     Logs {
         /// Only logs for this app (default: all apps).
         app: Option<String>,
+        /// Number of trailing lines to print per log file (default: 200).
+        #[arg(short = 'n', long, default_value = "200")]
+        tail: usize,
+        /// Keep tailing as the log files grow.
+        #[arg(short = 'f', long)]
+        follow: bool,
+    },
+    /// Generate a systemd unit file for `artzain up`.
+    Systemd {
+        /// Service account user to run as (default: artzain).
+        #[arg(long)]
+        user: Option<String>,
+        /// Service account group (default: same as user).
+        #[arg(long)]
+        group: Option<String>,
+        /// Path to the manifest in the unit (default: the -f file).
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Path to the artzain binary in the unit (default: /usr/local/bin/artzain).
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        /// Optional systemd MemoryMax= value (e.g. "512M", "2G").
+        #[arg(long)]
+        memory_max: Option<String>,
+        /// Write the unit to /etc/systemd/system/artzain@.service instead of stdout.
+        #[arg(long)]
+        install: bool,
     },
     /// Signal a running cluster to shut down.
     Down {
@@ -75,8 +112,24 @@ fn main() -> anyhow::Result<()> {
             run_async(up(&cli.file, opts))
         }
         Command::Plan { only } => plan(&cli.file, only.as_deref()),
-        Command::Status => print_status(&cli.file),
-        Command::Logs { app } => print_logs(&cli.file, app.as_deref()),
+        Command::Status { json, check } => print_status(&cli.file, json, check),
+        Command::Logs { app, tail, follow } => print_logs(&cli.file, app.as_deref(), tail, follow),
+        Command::Systemd {
+            user,
+            group,
+            manifest,
+            binary,
+            memory_max,
+            install,
+        } => generate_systemd(
+            &cli.file,
+            user.as_deref(),
+            group.as_deref(),
+            manifest.as_deref(),
+            binary.as_deref(),
+            memory_max.as_deref(),
+            install,
+        ),
         Command::Down { force } => down(&cli.file, force),
     }
 }
@@ -88,43 +141,92 @@ fn run_async<F: std::future::Future<Output = anyhow::Result<()>>>(fut: F) -> any
         .block_on(fut)
 }
 
-fn print_status(file: &std::path::Path) -> anyhow::Result<()> {
+fn print_status(file: &std::path::Path, json: bool, check: bool) -> anyhow::Result<()> {
     let state = read_status(file)?;
-    println!(
-        "cluster {}  (pid {}, updated {}s ago)\n",
-        state.project,
-        state.owner_pid,
-        now_unix().saturating_sub(state.updated_at),
-    );
-    println!(
-        "{:<16} {:<8} {:<7} {:<6} {:<8} RESTARTS",
-        "APP", "READY", "REPLICA", "PORT", "PHASE"
-    );
-    for app in &state.apps {
-        for inst in &app.instances {
-            println!(
-                "{:<16} {:<8} {:<7} {:<6} {:<8} {} ({}s up)",
-                app.name,
-                format!("{}/{}", app.ready, app.desired),
-                inst.replica,
-                inst.port,
-                inst.phase.as_str(),
-                inst.restarts,
-                inst.uptime_secs,
-            );
-        }
-        if app.instances.is_empty() {
-            println!(
-                "{:<16} {:<8} (no instances)",
-                app.name,
-                format!("{}/{}", app.ready, app.desired)
-            );
+
+    if json {
+        println!("{}", state.to_json());
+    } else {
+        println!(
+            "cluster {}  (pid {}, updated {}s ago)\n",
+            state.project,
+            state.owner_pid,
+            now_unix().saturating_sub(state.updated_at),
+        );
+        println!(
+            "{:<16} {:<8} {:<7} {:<6} {:<8} RESTARTS",
+            "APP", "READY", "REPLICA", "PORT", "PHASE"
+        );
+        for app in &state.apps {
+            for inst in &app.instances {
+                println!(
+                    "{:<16} {:<8} {:<7} {:<6} {:<8} {} ({}s up)",
+                    app.name,
+                    format!("{}/{}", app.ready, app.desired),
+                    inst.replica,
+                    inst.port,
+                    inst.phase.as_str(),
+                    inst.restarts,
+                    inst.uptime_secs,
+                );
+            }
+            if app.instances.is_empty() {
+                println!(
+                    "{:<16} {:<8} (no instances)",
+                    app.name,
+                    format!("{}/{}", app.ready, app.desired)
+                );
+            }
         }
     }
+
+    if check && state.apps.iter().any(|app| app.ready < app.desired) {
+        std::process::exit(1);
+    }
+
     Ok(())
 }
 
-fn print_logs(file: &std::path::Path, app: Option<&str>) -> anyhow::Result<()> {
+fn generate_systemd(
+    file: &std::path::Path,
+    user: Option<&str>,
+    group: Option<&str>,
+    manifest: Option<&std::path::Path>,
+    binary: Option<&std::path::Path>,
+    memory_max: Option<&str>,
+    install: bool,
+) -> anyhow::Result<()> {
+    let manifest = manifest.unwrap_or(file);
+    let user = user.unwrap_or("artzain");
+    let group = group.unwrap_or(user);
+    let binary = binary
+        .map(PathBuf::from)
+        .unwrap_or_else(systemd::default_binary);
+
+    let unit = systemd::generate_unit(systemd::UnitOptions {
+        user,
+        group,
+        manifest,
+        binary: &binary,
+        memory_max,
+        stop_grace_secs: STOP_GRACE.as_secs(),
+    });
+
+    if install {
+        let path = std::path::Path::new("/etc/systemd/system/artzain@.service");
+        systemd::install_unit(&unit, path)
+    } else {
+        print!("{}", unit);
+        Ok(())
+    }
+}
+
+fn print_logs(
+    file: &std::path::Path,
+    app: Option<&str>,
+    tail: usize,
+    follow: bool,
+) -> anyhow::Result<()> {
     let base_dir = file
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -135,37 +237,24 @@ fn print_logs(file: &std::path::Path, app: Option<&str>) -> anyhow::Result<()> {
         anyhow::bail!("no log directory found — is a cluster running?");
     }
 
-    let mut entries: Vec<_> = std::fs::read_dir(&log_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-        .map(|e| e.path())
-        .filter(|p| {
-            if let Some(app) = app {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.starts_with(app))
-                    .unwrap_or(false)
-            } else {
-                true
-            }
-        })
-        .collect();
-    entries.sort();
-
+    let entries = logs::log_files(&log_dir, app)?;
     if entries.is_empty() {
         println!("no log files found");
         return Ok(());
     }
 
-    for path in entries {
+    for path in &entries {
         println!(
             "--- {}",
             path.file_name().unwrap_or_default().to_string_lossy()
         );
-        match std::fs::read_to_string(&path) {
-            Ok(text) => print!("{}", text),
-            Err(e) => eprintln!("could not read {}: {e}", path.display()),
+        if let Err(e) = logs::tail(path, tail) {
+            eprintln!("could not tail {}: {e}", path.display());
         }
+    }
+
+    if follow {
+        logs::follow(&entries, std::time::Duration::from_millis(500))?;
     }
     Ok(())
 }

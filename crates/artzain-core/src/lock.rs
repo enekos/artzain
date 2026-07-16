@@ -7,6 +7,7 @@
 //! we fall back to "best effort": a lock file is still written and read, but we
 //! cannot detect a stale pid left by a crash.
 
+use crate::paths::write_private_file;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -52,12 +53,9 @@ impl Lock {
         }
 
         let raw = serde_json::to_string_pretty(&lock).unwrap_or_default();
-        if let Some(parent) = lock.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = write_private_file(&lock.path, raw.as_bytes()) {
+            anyhow::bail!("could not write lock file {}: {e}", lock.path.display());
         }
-        std::fs::write(&lock.path, raw).map_err(|e| {
-            anyhow::anyhow!("could not write lock file {}: {e}", lock.path.display())
-        })?;
         Ok(lock)
     }
 

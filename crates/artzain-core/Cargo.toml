@@ -16,3 +16,4 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+libc.workspace = true

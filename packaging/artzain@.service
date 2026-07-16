@@ -1,0 +1,20 @@
+[Unit]
+Description=artzain fleet for %i
+After=network.target
+
+[Service]
+Type=simple
+User=artzain
+Group=artzain
+ExecStart=/usr/local/bin/artzain -f %i up
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

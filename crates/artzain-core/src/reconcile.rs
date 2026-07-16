@@ -10,9 +10,10 @@
 //! and reproduce.
 
 use crate::lock::Lock;
-use crate::manifest::{App, Manifest};
+use crate::manifest::{App, Manifest, BASE_ENV_KEYS, DEFAULT_PATH};
+use crate::paths::ensure_private_dir;
 use crate::probe;
-use crate::process::{self, Spawn};
+use crate::process::{self, is_group_alive, is_pid_alive, signal_group, Spawn};
 use crate::state::{AppStatus, ClusterState, InstanceStatus, Phase};
 
 use std::collections::{BTreeMap, HashSet};
@@ -24,7 +25,10 @@ const READY_PERIOD: Duration = Duration::from_secs(1);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const CHECK_VERIFY_PERIOD: Duration = Duration::from_secs(10);
 /// Grace between SIGTERM and SIGKILL when stopping an instance.
-const STOP_GRACE: Duration = Duration::from_secs(10);
+pub const STOP_GRACE: Duration = Duration::from_secs(10);
+/// Grace for orphan reclamation on startup: shorter than STOP_GRACE because
+/// the previous owner is already dead and we want to claim the ports quickly.
+const ORPHAN_RECLAIM_GRACE: Duration = Duration::from_secs(2);
 /// Rolling-update budget: at most this many of an app's replicas may be
 /// unavailable at once while replacing stale instances (k8s maxUnavailable).
 const MAX_UNAVAILABLE: usize = 1;
@@ -39,6 +43,111 @@ pub struct UpOptions {
     pub watch: bool,
 }
 
+/// Run the reconcile loop until `predicate` returns true or `max_steps` ticks
+/// have elapsed. Uses `tick` as the wall-clock sleep between ticks. If
+/// `watch_manifest` is true, `maybe_reload()` is called each tick.
+///
+/// This is the single driver used by both `up` and integration tests so the
+/// tested loop is the shipped loop.
+///
+/// Returns `true` if the predicate was satisfied.
+pub async fn run_until(
+    r: &mut Reconciler,
+    predicate: impl Fn(&ClusterState) -> bool,
+    max_steps: usize,
+    tick: Duration,
+    watch_manifest: bool,
+) -> bool {
+    for step in 0..max_steps {
+        if watch_manifest {
+            r.maybe_reload();
+        }
+        r.reconcile().await;
+        r.write_state();
+        if predicate(&r.snapshot()) {
+            return true;
+        }
+        // Sleep between ticks, but not after the last step. With max_steps set
+        // to usize::MAX by `up`, this is effectively an infinite loop.
+        if step + 1 < max_steps {
+            tokio::time::sleep(tick).await;
+        }
+    }
+    false
+}
+
+/// Reclaim orphaned child process groups left behind when a previous `up`
+/// died without running teardown (kill -9, OOM, reboot). If the recorded
+/// owner pid is dead, SIGTERM every recorded pgid, wait `STOP_GRACE`, then
+/// SIGKILL stragglers, and remove the stale state/lock files so the new
+/// `up` starts from a clean manifest.
+pub async fn reclaim_orphans(base_dir: &Path) -> anyhow::Result<()> {
+    let state_path = base_dir.join(".artzain").join("state.json");
+    let raw = match std::fs::read_to_string(&state_path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(anyhow::anyhow!("reading stale state.json: {e}")),
+    };
+
+    let state: ClusterState = match ClusterState::from_json(&raw) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not parse stale state.json; removing and continuing");
+            let _ = std::fs::remove_file(&state_path);
+            return Ok(());
+        }
+    };
+
+    if is_pid_alive(state.owner_pid as i32) {
+        // Owner is still alive; this is unexpected because we hold the lock,
+        // but leave the state alone and let the lock check surface the issue.
+        return Ok(());
+    }
+
+    tracing::warn!(
+        owner_pid = state.owner_pid,
+        "prior owner is dead — reclaiming orphans"
+    );
+
+    for app in &state.apps {
+        for inst in &app.instances {
+            if let Some(pgid) = inst.pgid {
+                signal_group(pgid, libc::SIGTERM);
+            }
+        }
+    }
+
+    let deadline = Instant::now() + ORPHAN_RECLAIM_GRACE;
+    loop {
+        let all_done = state
+            .apps
+            .iter()
+            .flat_map(|a| &a.instances)
+            .all(|i| i.pgid.map(|pgid| !is_group_alive(pgid)).unwrap_or(true));
+        if all_done {
+            break;
+        }
+        if Instant::now() >= deadline {
+            for app in &state.apps {
+                for inst in &app.instances {
+                    if let Some(pgid) = inst.pgid {
+                        if is_group_alive(pgid) {
+                            signal_group(pgid, libc::SIGKILL);
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let _ = std::fs::remove_file(&state_path);
+    let lock_path = Lock::path(base_dir);
+    let _ = std::fs::remove_file(&lock_path);
+    Ok(())
+}
+
 pub async fn up(manifest_path: &Path, opts: UpOptions) -> anyhow::Result<()> {
     let manifest = Manifest::load(manifest_path)?;
     let selected = select_apps(&manifest, opts.only.as_deref())?;
@@ -48,6 +157,10 @@ pub async fn up(manifest_path: &Path, opts: UpOptions) -> anyhow::Result<()> {
 
     // Take the lock early so two `up` runs can't clobber the same state file.
     let _lock = Lock::acquire(&manifest.base_dir)?;
+
+    // If a previous owner died without teardown, reclaim its orphaned children
+    // before we try to bind the same ports.
+    reclaim_orphans(&manifest.base_dir).await?;
 
     // Verify external dependencies once, up front — fail fast with the hint
     // rather than crash-looping an app against a Postgres that isn't up.
@@ -63,13 +176,7 @@ pub async fn up(manifest_path: &Path, opts: UpOptions) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = crate::shutdown_signal() => break,
-            _ = tokio::time::sleep(TICK) => {
-                if opts.watch {
-                    r.maybe_reload();
-                }
-                r.reconcile().await;
-                r.write_state();
-            }
+            _ = run_until(&mut r, |_| false, usize::MAX, TICK, opts.watch) => {}
         }
     }
 
@@ -132,7 +239,7 @@ impl Instance {
     }
 }
 
-struct Reconciler {
+pub struct Reconciler {
     manifest: Manifest,
     manifest_path: PathBuf,
     /// The mtime of the manifest we're currently reconciling to.
@@ -156,13 +263,16 @@ struct Reconciler {
 }
 
 impl Reconciler {
-    fn new(
+    pub fn new(
         manifest: Manifest,
         manifest_path: PathBuf,
         selected: HashSet<String>,
         checks_ok: BTreeMap<String, bool>,
     ) -> Self {
         let state_path = manifest.base_dir.join(".artzain").join("state.json");
+        if let Some(dir) = state_path.parent() {
+            let _ = ensure_private_dir(dir);
+        }
         let mtime = file_mtime(&manifest_path);
         Self {
             manifest,
@@ -185,7 +295,7 @@ impl Reconciler {
     /// half-written; (2) any parse error, or a manifest that reloads to zero
     /// apps (what an empty/partial file looks like), is rejected and the last
     /// good state is kept.
-    fn maybe_reload(&mut self) {
+    pub fn maybe_reload(&mut self) {
         let current = file_mtime(&self.manifest_path);
         if current == self.manifest_mtime {
             self.pending_mtime = None;
@@ -293,7 +403,7 @@ impl Reconciler {
         }
     }
 
-    async fn reconcile(&mut self) {
+    pub async fn reconcile(&mut self) {
         self.reverify_checks().await;
         self.reap();
         let desired = self.desired_slots();
@@ -645,6 +755,11 @@ impl Reconciler {
             cwd: &cwd,
             env: &env,
             log_path: Some(log_path),
+            log_max_bytes: self.manifest.defaults.log_max_bytes,
+            log_keep: self.manifest.defaults.log_keep,
+            uid: app.uid,
+            gid: app.gid,
+            limits: app.limits.clone(),
         };
         match process::spawn(&spawn) {
             Ok(handle) => {
@@ -760,7 +875,7 @@ impl Reconciler {
 
     /// Graceful teardown in reverse dependency order: SIGTERM every instance,
     /// wait for exits up to the grace window, then SIGKILL stragglers.
-    async fn teardown(&mut self) {
+    pub async fn teardown(&mut self) {
         let order = self
             .manifest
             .apps_ordered()
@@ -802,7 +917,7 @@ impl Reconciler {
         }
     }
 
-    fn snapshot(&self) -> ClusterState {
+    pub fn snapshot(&self) -> ClusterState {
         let now = Instant::now();
         let mut apps: BTreeMap<String, Vec<InstanceStatus>> = BTreeMap::new();
         for inst in &self.instances {
@@ -813,6 +928,7 @@ impl Reconciler {
                     port: inst.port,
                     phase: inst.phase,
                     pid: inst.handle.as_ref().and_then(|h| h.child.id()),
+                    pgid: inst.handle.as_ref().map(|h| h.pgid),
                     restarts: inst.restarts,
                     uptime_secs: inst
                         .started_at
@@ -838,6 +954,7 @@ impl Reconciler {
             })
             .collect();
         ClusterState {
+            state_version: 1,
             project: self.manifest.project().to_string(),
             owner_pid: std::process::id(),
             updated_at: now_unix(),
@@ -845,19 +962,11 @@ impl Reconciler {
         }
     }
 
-    fn write_state(&self) {
+    pub fn write_state(&self) {
         let state = self.snapshot();
-        if let Some(dir) = self.state_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                tracing::error!(
-                    path = %self.state_path.display(),
-                    error = %e,
-                    "could not create state directory"
-                );
-                return;
-            }
-        }
-        if let Err(e) = std::fs::write(&self.state_path, state.to_json()) {
+        if let Err(e) =
+            crate::paths::write_private_file(&self.state_path, state.to_json().as_bytes())
+        {
             tracing::error!(
                 path = %self.state_path.display(),
                 error = %e,
@@ -907,10 +1016,48 @@ fn backoff_delay(base_ms: u64, cap_ms: u64, restarts: u32) -> Duration {
     Duration::from_millis(ms)
 }
 
-/// Env for one instance: `[defaults].env`, then the app's own env (wins), then
-/// the per-instance `PORT`/`ARTZAIN_*` pointers. The inherited process env
-/// (PATH, HOME, ...) is kept implicitly by `Command`.
+/// Env for one instance: inherited base/allowlist keys, then `[defaults].env`,
+/// then the app's own env, then the per-instance `PORT`/`ARTZAIN_*` pointers.
+/// Because `spawn` calls `env_clear()`, this map is the child's *entire* env.
 fn instance_env(
+    manifest: &Manifest,
+    app: &App,
+    replica: u32,
+    port: u16,
+) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+
+    // Inherit base keys (not hashed — parent env drift must not roll the app).
+    for key in BASE_ENV_KEYS {
+        if key == &"PATH" {
+            let path = std::env::var("PATH").unwrap_or_else(|_| DEFAULT_PATH.to_string());
+            env.insert(key.to_string(), path);
+        } else if let Ok(value) = std::env::var(key) {
+            env.insert(key.to_string(), value);
+        }
+    }
+    for key in &manifest.defaults.inherit_env {
+        if let Ok(value) = std::env::var(key) {
+            env.insert(key.clone(), value);
+        }
+    }
+
+    for (k, v) in &manifest.defaults.env {
+        env.insert(k.clone(), v.clone());
+    }
+    for (k, v) in &app.env {
+        env.insert(k.clone(), v.clone());
+    }
+    env.insert("PORT".to_string(), port.to_string());
+    env.insert("ARTZAIN_APP".to_string(), app.name.clone());
+    env.insert("ARTZAIN_REPLICA".to_string(), replica.to_string());
+    env
+}
+
+/// The configured env that should trigger a relaunch when it changes. The
+/// inherited process env is intentionally excluded so PATH/HOME/etc. drift does
+/// not restart apps.
+fn configured_env(
     manifest: &Manifest,
     app: &App,
     replica: u32,
@@ -931,7 +1078,8 @@ fn instance_env(
 
 /// Hash the parts of an app spec whose change requires relaunching an
 /// instance. `replicas` is intentionally excluded — scaling adds/removes
-/// slots, it doesn't restart existing ones.
+/// slots, it doesn't restart existing ones. Inherited env is excluded so
+/// parent-env drift does not roll the app.
 fn spec_hash(manifest: &Manifest, app: &App, replica: u32, port: u16) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -944,7 +1092,7 @@ fn spec_hash(manifest: &Manifest, app: &App, replica: u32, port: u16) -> u64 {
     app.live_period.hash(&mut h);
     app.live_failures.hash(&mut h);
     app.ready_timeout.hash(&mut h);
-    for (k, v) in instance_env(manifest, app, replica, port) {
+    for (k, v) in configured_env(manifest, app, replica, port) {
         k.hash(&mut h);
         v.hash(&mut h);
     }
