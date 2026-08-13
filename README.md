@@ -7,14 +7,6 @@ file — starting processes, restarting crashed ones with exponential backoff,
 driving HTTP readiness/liveness probes, rolling apps when the file changes, and
 tearing everything down gracefully on Ctrl-C.
 
-*artzain* is Basque for **shepherd** — it keeps the flock of app instances at
-the desired count. It's the local-first cousin of [laino](../laino) (the GCP
-emulator), reusing laino's process-supervision approach and adding the control
-loop that makes it k8s-like: replicas, restart policy, probes, rolling updates.
-
-Built for [sutegi](../sutegi) apps — which already expose `/__ready`,
-`/__health`, `/__metrics`, and drain gracefully on SIGTERM — but it supervises
-any process that serves HTTP health, or none at all.
 
 ## Non-goals (on purpose)
 
