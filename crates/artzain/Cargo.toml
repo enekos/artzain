@@ -2,7 +2,15 @@
 name = "artzain"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "A tiny k8s-shaped orchestrator for prebuilt binaries: a declarative manifest and a reconcile loop that keeps N replicas of each app alive."
+readme = "../../README.md"
 
 [[bin]]
 name = "artzain"

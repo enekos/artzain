@@ -69,7 +69,7 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "artzain"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "artzain-core",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "artzain-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "artzain-fixture"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "tokio",

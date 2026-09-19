@@ -7,13 +7,18 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+rust-version = "1.75"
 license = "MIT"
 repository = "https://github.com/enekos/artzain"
+homepage = "https://github.com/enekos/artzain"
+authors = ["Eneko Sarasola"]
+keywords = ["orchestrator", "supervisor", "process", "systemd", "reconcile"]
+categories = ["command-line-utilities", "development-tools", "os::unix-apis"]
 
 [workspace.dependencies]
-artzain-core = { path = "crates/artzain-core" }
+artzain-core = { path = "crates/artzain-core", version = "1.0.0" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "io-util", "time", "signal", "sync", "fs"] }
 clap = { version = "4", features = ["derive", "env"] }

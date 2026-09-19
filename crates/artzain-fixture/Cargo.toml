@@ -3,6 +3,7 @@ name = "artzain-fixture"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [[bin]]
 name = "artzain-fixture"

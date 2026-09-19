@@ -2,7 +2,15 @@
 name = "artzain-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Reconcile loop, manifest and process supervision behind the artzain orchestrator."
+readme = "../../README.md"
 
 [dependencies]
 tokio.workspace = true
