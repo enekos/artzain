@@ -8,11 +8,10 @@ members = [
 
 [workspace.package]
 version = "1.0.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.100"
 license = "MIT"
 repository = "https://github.com/enekos/artzain"
-homepage = "https://github.com/enekos/artzain"
 authors = ["Eneko Sarasola"]
 keywords = ["orchestrator", "supervisor", "process", "systemd", "reconcile"]
 categories = ["command-line-utilities", "development-tools", "os::unix-apis"]
@@ -26,11 +25,30 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 anyhow = "1"
-thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
 
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+rc_mutex = "deny"
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+multiple_unsafe_ops_per_block = "deny"
+mem_forget = "deny"
+clone_on_ref_ptr = "warn"
+dbg_macro = "deny"
+todo = "deny"
+allow_attributes_without_reason = "warn"
+
 [profile.release]
 lto = "thin"
+codegen-units = 1
 strip = true
+overflow-checks = true

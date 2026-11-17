@@ -1,21 +1,47 @@
 //! Filesystem helpers for creating private directories and files under the
 //! `.artzain` control-plane directory. Everything artzain writes is owned by
 //! the service account and must not be readable by other users.
+//!
+//! artzain often runs as root while the manifest directory belongs to the app
+//! account, so every directory is checked to be a real directory owned by us
+//! (never a symlink someone swapped in) and every file is opened with
+//! `O_NOFOLLOW`.
 
 use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-/// Create `dir` and set its permissions to `0700` (owner-only).
+/// Create `dir` if missing and make sure it is a `0700` directory owned by the
+/// effective user. Refuses symlinks and directories owned by anyone else.
 pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    #[cfg(unix)]
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty())
+        && !parent.exists()
     {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        return Err(refused(dir, "is not a directory (symlink?)"));
+    }
+    if meta.uid() != crate::sys::euid() {
+        return Err(refused(dir, "is owned by another user"));
+    }
+    if meta.mode() & 0o777 != 0o700 {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+fn refused(path: &Path, why: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("refusing to use {}: {why}", path.display()),
+    )
 }
 
 /// Atomically replace `path` with `contents`, mode `0600` (owner-only).
@@ -24,6 +50,7 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         ensure_private_dir(dir)?;
     }
     let tmp = temp_sibling(path);
+    let _ = std::fs::remove_file(&tmp);
     match write_then_sync(&tmp, contents).and_then(|()| std::fs::rename(&tmp, path)) {
         Ok(()) => {
             sync_parent_dir(path);
@@ -37,11 +64,12 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 }
 
 fn write_then_sync(tmp: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    opts.mode(0o600);
-    let mut file = opts.open(tmp)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(tmp)?;
     file.write_all(contents)?;
     file.sync_all()
 }
@@ -55,39 +83,51 @@ fn temp_sibling(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-#[cfg(unix)]
 fn sync_parent_dir(path: &Path) {
-    if let Some(dir) = path.parent() {
-        if let Ok(handle) = std::fs::File::open(dir) {
-            let _ = handle.sync_all();
-        }
+    if let Some(dir) = path.parent()
+        && let Ok(handle) = std::fs::File::open(dir)
+    {
+        let _ = handle.sync_all();
     }
 }
 
-#[cfg(not(unix))]
-fn sync_parent_dir(_path: &Path) {}
+/// Open a file for appending with `0600`, refusing to follow a symlink.
+pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
 
-/// Async version of log-file opening: creates parent dirs with `0700` and
-/// opens the file with `0600`.
+/// Open or create a file read-write with `0600` without truncating it,
+/// refusing to follow a symlink.
+pub fn open_private_rw(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Open an existing file read-only, refusing to follow a symlink.
+pub fn open_private_read(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Async version of log-file opening: checks the parent dir and opens the file
+/// with `0600`.
 pub async fn open_private_log_file(path: &Path) -> std::io::Result<tokio::fs::File> {
-    if let Some(dir) = path.parent() {
-        tokio::fs::create_dir_all(dir).await?;
-        #[cfg(unix)]
-        {
-            let dir = dir.to_path_buf();
-            tokio::task::spawn_blocking(move || {
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            })
-            .await??;
-        }
-    }
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        opts.mode(0o600);
-    }
-    opts.open(path).await
+    let path = path.to_path_buf();
+    let file = tokio::task::spawn_blocking(move || open_private_log_file_sync(&path)).await??;
+    Ok(tokio::fs::File::from_std(file))
 }
 
 /// Synchronous version of log-file opening for use before the async runtime
@@ -96,20 +136,14 @@ pub fn open_private_log_file_sync(path: &Path) -> std::io::Result<std::fs::File>
     if let Some(dir) = path.parent() {
         ensure_private_dir(dir)?;
     }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        opts.mode(0o600);
-    }
-    opts.open(path)
+    open_private_append(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[test]
     fn replaces_contents_and_keeps_owner_only_mode() {
@@ -120,11 +154,8 @@ mod tests {
         write_private_file(&path, b"second").unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"second");
-        #[cfg(unix)]
-        {
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
@@ -181,5 +212,41 @@ mod tests {
 
         assert!(reads.load(Ordering::Relaxed) > 0);
         assert_eq!(partial_reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn refuses_a_symlinked_control_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let control = dir.path().join(".artzain");
+        std::os::unix::fs::symlink(&elsewhere, &control).unwrap();
+
+        let err = write_private_file(&control.join("state.json"), b"x").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!elsewhere.join("state.json").exists());
+    }
+
+    #[test]
+    fn refuses_to_append_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"").unwrap();
+        let link = dir.path().join("app-0.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(open_private_log_file_sync(&link).is_err());
+    }
+
+    #[test]
+    fn tightens_a_loose_control_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join(".artzain");
+        std::fs::create_dir(&control).unwrap();
+        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        ensure_private_dir(&control).unwrap();
+        let mode = std::fs::metadata(&control).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 }

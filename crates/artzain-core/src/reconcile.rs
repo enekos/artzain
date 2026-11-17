@@ -10,11 +10,12 @@
 //! and reproduce.
 
 use crate::lock::Lock;
-use crate::manifest::{App, Manifest, BASE_ENV_KEYS, DEFAULT_PATH};
+use crate::manifest::{App, BASE_ENV_KEYS, DEFAULT_PATH, Manifest};
 use crate::paths::ensure_private_dir;
 use crate::probe;
-use crate::process::{self, is_group_alive, is_pid_alive, signal_group, Spawn};
+use crate::process::{self, Spawn, signal_group};
 use crate::state::{AppStatus, ClusterState, InstanceStatus, Phase};
+use crate::sys::{group_alive, pgid_of, pid_alive};
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -98,7 +99,7 @@ pub async fn reclaim_orphans(base_dir: &Path) -> anyhow::Result<()> {
         }
     };
 
-    if is_pid_alive(state.owner_pid as i32) {
+    if i32::try_from(state.owner_pid).is_ok_and(pid_alive) {
         // Owner is still alive; this is unexpected because we hold the lock,
         // but leave the state alone and let the lock check surface the issue.
         return Ok(());
@@ -109,32 +110,20 @@ pub async fn reclaim_orphans(base_dir: &Path) -> anyhow::Result<()> {
         "prior owner is dead — reclaiming orphans"
     );
 
-    for app in &state.apps {
-        for inst in &app.instances {
-            if let Some(pgid) = inst.pgid {
-                signal_group(pgid, libc::SIGTERM);
-            }
-        }
+    let groups = reclaimable_groups(&state);
+    for &pgid in &groups {
+        signal_group(pgid, libc::SIGTERM);
     }
 
     let deadline = Instant::now() + ORPHAN_RECLAIM_GRACE;
     loop {
-        let all_done = state
-            .apps
-            .iter()
-            .flat_map(|a| &a.instances)
-            .all(|i| i.pgid.map(|pgid| !is_group_alive(pgid)).unwrap_or(true));
-        if all_done {
+        if groups.iter().all(|&pgid| !group_alive(pgid)) {
             break;
         }
         if Instant::now() >= deadline {
-            for app in &state.apps {
-                for inst in &app.instances {
-                    if let Some(pgid) = inst.pgid {
-                        if is_group_alive(pgid) {
-                            signal_group(pgid, libc::SIGKILL);
-                        }
-                    }
+            for &pgid in &groups {
+                if group_alive(pgid) {
+                    signal_group(pgid, libc::SIGKILL);
                 }
             }
             break;
@@ -143,9 +132,34 @@ pub async fn reclaim_orphans(base_dir: &Path) -> anyhow::Result<()> {
     }
 
     let _ = std::fs::remove_file(&state_path);
-    let lock_path = Lock::path(base_dir);
-    let _ = std::fs::remove_file(&lock_path);
     Ok(())
+}
+
+/// The recorded process groups that are still provably ours. A pgid is only
+/// signalled when the instance's recorded pid is alive and still leads that
+/// group (we spawn every instance as its own group leader), and never when the
+/// state predates the last boot: after a reboot every recorded id may belong
+/// to an unrelated process, and artzain often runs as root.
+fn reclaimable_groups(state: &ClusterState) -> Vec<i32> {
+    if crate::sys::boot_time().is_some_and(|boot| state.updated_at < boot) {
+        tracing::warn!("state.json predates the last boot — not signalling recorded groups");
+        return Vec::new();
+    }
+    let mut groups = Vec::new();
+    for inst in state.apps.iter().flat_map(|a| &a.instances) {
+        let (Some(pid), Some(pgid)) = (inst.pid, inst.pgid) else {
+            continue;
+        };
+        match i32::try_from(pid) {
+            Ok(pid) if pid == pgid && pgid_of(pid) == Some(pgid) => groups.push(pgid),
+            _ => tracing::warn!(
+                pid,
+                pgid,
+                "recorded instance no longer leads its group — leaving it alone"
+            ),
+        }
+    }
+    groups
 }
 
 pub async fn up(manifest_path: &Path, opts: UpOptions) -> anyhow::Result<()> {
@@ -188,6 +202,7 @@ pub async fn up(manifest_path: &Path, opts: UpOptions) -> anyhow::Result<()> {
 
 /// One managed process slot: desired `(app, replica)` plus everything about
 /// the process currently (not) filling it.
+#[derive(Debug)]
 struct Instance {
     app: String,
     replica: u32,
@@ -239,6 +254,7 @@ impl Instance {
     }
 }
 
+#[derive(Debug)]
 pub struct Reconciler {
     manifest: Manifest,
     manifest_path: PathBuf,
@@ -460,13 +476,12 @@ impl Reconciler {
                 Ok(None) => {
                     // Still running. If we asked it to stop and it ignored
                     // SIGTERM past the grace window, escalate.
-                    if inst.phase == Phase::Terminating {
-                        if let Some(dl) = inst.kill_deadline {
-                            if now >= dl {
-                                process::kill(handle);
-                                inst.kill_deadline = Some(now + Duration::from_secs(2));
-                            }
-                        }
+                    if inst.phase == Phase::Terminating
+                        && let Some(dl) = inst.kill_deadline
+                        && now >= dl
+                    {
+                        process::kill(handle);
+                        inst.kill_deadline = Some(now + Duration::from_secs(2));
                     }
                 }
                 Err(_) => {}
@@ -1092,6 +1107,10 @@ fn spec_hash(manifest: &Manifest, app: &App, replica: u32, port: u16) -> u64 {
     app.live_period.hash(&mut h);
     app.live_failures.hash(&mut h);
     app.ready_timeout.hash(&mut h);
+    app.uid.hash(&mut h);
+    app.gid.hash(&mut h);
+    app.limits.hash(&mut h);
+    manifest.defaults.inherit_env.hash(&mut h);
     for (k, v) in configured_env(manifest, app, replica, port) {
         k.hash(&mut h);
         v.hash(&mut h);
@@ -1189,6 +1208,8 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::process::CommandExt;
 
     #[test]
     fn backoff_grows_and_caps() {
@@ -1235,6 +1256,16 @@ args = ["--flag"]
             spec_hash(&m, a, 0, 8080),
             spec_hash(&m2, &m2.apps[0], 0, 8080)
         );
+
+        let mut tightened = a.clone();
+        tightened.uid = Some(65534);
+        assert_ne!(h1, spec_hash(&m, &tightened, 0, 8080));
+        let mut limited = a.clone();
+        limited.limits = Some(crate::manifest::Limits {
+            open_files: Some(64),
+            memory_mb: None,
+        });
+        assert_ne!(h1, spec_hash(&m, &limited, 0, 8080));
     }
 
     #[test]
@@ -1273,6 +1304,55 @@ port = 7000
             ("127.0.0.1:8080", "/health")
         );
         assert_eq!(split_host_path("127.0.0.1:8080"), ("127.0.0.1:8080", "/"));
+    }
+
+    fn state_with(pid: u32, pgid: i32, updated_at: u64) -> ClusterState {
+        ClusterState {
+            state_version: 1,
+            project: "t".to_string(),
+            owner_pid: 999_999,
+            updated_at,
+            apps: vec![AppStatus {
+                name: "a".to_string(),
+                desired: 1,
+                ready: 0,
+                instances: vec![InstanceStatus {
+                    replica: 0,
+                    port: 1,
+                    phase: Phase::Ready,
+                    pid: Some(pid),
+                    pgid: Some(pgid),
+                    restarts: 0,
+                    uptime_secs: 0,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn reclaim_skips_groups_the_recorded_pid_does_not_lead() {
+        assert!(reclaimable_groups(&state_with(1, 4242, now_unix())).is_empty());
+        let me = std::process::id();
+        let mine = crate::sys::pgid_of(me as i32).unwrap();
+        if mine != me as i32 {
+            assert!(reclaimable_groups(&state_with(me, mine, now_unix())).is_empty());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reclaim_skips_state_from_before_the_last_boot() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let fresh = state_with(pid, pid as i32, now_unix());
+        assert_eq!(reclaimable_groups(&fresh), vec![pid as i32]);
+        assert!(reclaimable_groups(&state_with(pid, pid as i32, 0)).is_empty());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

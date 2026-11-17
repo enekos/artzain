@@ -55,7 +55,7 @@ $ artzain down            # stop the running cluster
 | `artzain plan [--only a,b]` | Validate the manifest and print what `up` would do. |
 | `artzain status [--json] [--check]` | Print the state of a running cluster; `--json` is machine-readable, `--check` exits non-zero when not fully ready. |
 | `artzain logs [app] [--tail N] [--follow]` | Print persisted logs; `--tail` defaults to 200, `--follow` polls rotated files. |
-| `artzain down [--force]` | Signal a running cluster to shut down. `--force` skips the lock-file safety check. |
+| `artzain down [--force]` | Signal a running cluster to shut down. Only a process that holds the cluster lock is signalled; `--force` falls back to the pid recorded in `state.json`. |
 | `artzain systemd [--user] [--group] [--manifest] [--binary] [--memory-max] [--install]` | Generate a hardened systemd unit; `--install` writes it to `/etc/systemd/system/artzain@.service`. |
 
 `-f/--file` points at a manifest other than `./artzain.toml`.
@@ -101,6 +101,7 @@ project = "demo"                       # cosmetic label
 
 [vars]                                 # ${name} interpolation; ARTZAIN_VAR_<NAME> overrides
 root = "/srv/app"                      # use $$ for a literal $, e.g. "$${name}" or "$$HOME"
+                                       # values may not contain quotes, backslashes or control chars
 
 [defaults]
 env = { RUST_LOG = "info" }            # merged into every app (app env wins)
@@ -118,7 +119,7 @@ tcp = "127.0.0.1:5432"                 # or: http = "127.0.0.1:8000/health"
 hint = "brew services start postgresql@17"
 
 [[app]]
-name = "web"
+name = "web"                           # [A-Za-z0-9._-], max 64; becomes a log file name
 bin = "${root}/target/release/web"     # prebuilt binary (resolved vs manifest dir)
 args = []                              # extra argv
 dir = "."                              # working dir (default: manifest dir)
@@ -132,15 +133,31 @@ ready_timeout = 60                     # seconds to first-ready before a restart
 live_period = 5                        # seconds between liveness probes
 live_failures = 3                      # consecutive liveness fails that restart
 user = "www-data"                      # drop to this user before exec (Unix only)
-group = "www-data"                     # drop to this group before exec (default: user's primary group)
+group = "www-data"                     # drop to this group before exec (default: user's primary group; needs `user`)
 limits = { open_files = 65536, memory_mb = 512 }  # per-process rlimits (Unix only)
 ```
 
 **Orphan reclamation.** If a previous `artzain up` died without teardown
 (`kill -9`, OOM, reboot), its child process groups would keep holding ports and
 block the next `up`. On startup `up` checks the stale `state.json`: if the
-recorded owner pid is dead, it SIGTERM→SIGKILLs each recorded process group,
-removes the stale state and lock files, and starts fresh.
+recorded owner pid is dead, it SIGTERM→SIGKILLs each recorded process group
+whose recorded pid is still alive and still leads that group, then removes the
+stale state and starts fresh. Groups that fail that check — and, on Linux, any
+state written before the last boot — are left alone, because their ids may now
+belong to unrelated processes.
+
+**The cluster lock** is a `flock(2)` on `.artzain/lock`, held for the life of
+`up` and released by the kernel when the process dies. `up` refuses to start
+while another process holds it, and `down` only signals the holder.
+
+**Control directory.** artzain refuses to use a `.artzain/` (or its `logs/`)
+that is a symlink or is owned by another user, and opens every file in it with
+`O_NOFOLLOW`. This matters when artzain runs as root in a directory the app
+account can write.
+
+**Logs** are capped at 16 KiB per line, and terminal control characters in app
+output are replaced with `?` before they reach the console, the log files or
+`artzain logs`.
 
 **Environment isolation.** Children start with a clean slate: `env_clear()` removes the parent environment, then artzain re-adds a documented base-key set (`PATH`, `HOME`, `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`) plus anything listed in `[defaults].inherit_env`. Manifest env values never appear in the state file or log output.
 

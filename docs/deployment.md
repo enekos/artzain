@@ -145,9 +145,11 @@ ProxyPassReverse / balancer://web/
 
 ### Stale lock / state after a crash
 
-If `up` died without teardown (OOM, `kill -9`), the next `up` automatically
-reclaims the orphaned child process groups and removes the stale lock/state on
-startup. A manual `systemctl restart artzain@default` triggers this.
+If `up` died without teardown (OOM, `kill -9`), the kernel has already released
+its lock, and the next `up` reclaims the orphaned child process groups and
+removes the stale state on startup. A manual `systemctl restart
+artzain@default` triggers this. Groups whose recorded leader is gone are only
+logged, not signalled; find them with `ps -eo pid,pgid,cmd` and stop them by hand.
 
 ### Wedged app
 

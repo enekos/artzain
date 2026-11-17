@@ -2,9 +2,14 @@
 //! (the `artzain-fixture` binary) through the real reconcile loop, so behavior
 //! is proven against the shipped loop, not against mocks.
 
+#![allow(
+    unsafe_code,
+    reason = "tests look up users and mutate env via libc/std"
+)]
+
 use artzain_core::{
-    reclaim_orphans, run_until, select_apps, AppStatus, ClusterState, InstanceStatus, Manifest,
-    Phase, Reconciler,
+    AppStatus, ClusterState, InstanceStatus, Manifest, Phase, Reconciler, reclaim_orphans,
+    run_until, select_apps,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,20 +27,24 @@ fn alloc_ports(n: u16) -> u16 {
 }
 
 /// Locate the fixture binary. Cargo sets `CARGO_BIN_EXE_artzain-fixture` for
-/// binaries built as part of the test run; otherwise fall back to the same
-/// `target/debug` directory the current test binary was built in. As a last
-/// resort, build the fixture crate on demand so `cargo test -p artzain-core`
-/// works locally without a manual build step.
+/// binaries built as part of the test run; otherwise look in the profile
+/// directory above the current test binary — `target/debug/deps/` before Rust
+/// 1.100, `target/debug/build/<pkg>/<hash>/` after. As a last resort, build
+/// the fixture crate on demand so `cargo test -p artzain-core` works locally
+/// without a manual build step.
 fn fixture_bin() -> PathBuf {
     if let Ok(p) = std::env::var("CARGO_BIN_EXE_artzain-fixture") {
         return p.into();
     }
     let current_exe = std::env::current_exe().expect("current exe");
-    // current_exe is target/debug/deps/integration-...; the fixture is at
-    // target/debug/artzain-fixture.
-    let debug_dir = current_exe.parent().unwrap().parent().unwrap();
-    let path = debug_dir.join("artzain-fixture");
-    if path.exists() {
+    let find = || {
+        current_exe
+            .ancestors()
+            .skip(1)
+            .map(|dir| dir.join("artzain-fixture"))
+            .find(|p| p.is_file())
+    };
+    if let Some(path) = find() {
         return path;
     }
     let output = std::process::Command::new("cargo")
@@ -48,7 +57,7 @@ fn fixture_bin() -> PathBuf {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    path
+    find().expect("fixture binary after build")
 }
 
 struct Harness {
@@ -118,14 +127,15 @@ async fn http_get(port: u16, path: &str) -> Option<String> {
 
 /// Return the current effective uid.
 #[cfg(unix)]
-#[allow(dead_code)]
+#[allow(dead_code, reason = "only the root-gated tests call it")]
 fn current_uid() -> u32 {
+    // SAFETY: getuid(2) has no preconditions and cannot fail.
     unsafe { libc::getuid() }
 }
 
 /// Return the name of the user to drop to when running as root, or None.
 #[cfg(unix)]
-#[allow(dead_code)]
+#[allow(dead_code, reason = "only the root-gated tests call it")]
 fn drop_target_user() -> Option<(String, u32, u32)> {
     use std::ffi::CStr;
     if current_uid() != 0 {
@@ -133,36 +143,40 @@ fn drop_target_user() -> Option<(String, u32, u32)> {
     }
     // Prefer the user that invoked sudo, so the test can run in a normal
     // macOS/Linux sudo setup.
-    if let (Ok(uid_str), Ok(gid_str)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
-        if let (Ok(uid), Ok(gid)) = (uid_str.parse::<u32>(), gid_str.parse::<u32>()) {
-            if uid != 0 {
-                // Look up the name for manifest friendliness.
-                let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-                let mut buf = vec![0u8; 1024];
-                let mut result: *mut libc::passwd = std::ptr::null_mut();
-                unsafe {
-                    libc::getpwuid_r(
-                        uid,
-                        &mut pwd,
-                        buf.as_mut_ptr() as *mut libc::c_char,
-                        buf.len(),
-                        &mut result,
-                    );
-                }
-                if !result.is_null() {
-                    let name = unsafe { CStr::from_ptr(pwd.pw_name) }
-                        .to_string_lossy()
-                        .to_string();
-                    return Some((name, uid, gid));
-                }
-            }
+    if let (Ok(uid_str), Ok(gid_str)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID"))
+        && let (Ok(uid), Ok(gid)) = (uid_str.parse::<u32>(), gid_str.parse::<u32>())
+        && uid != 0
+    {
+        // Look up the name for manifest friendliness.
+        // SAFETY: passwd is a plain C struct; all-zero is a valid value.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut buf = vec![0u8; 1024];
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every pointer is valid and `buf.len()` is its true length.
+        unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut pwd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            );
+        }
+        if !result.is_null() {
+            // SAFETY: on success pw_name is a NUL-terminated string in `buf`.
+            let name = unsafe { CStr::from_ptr(pwd.pw_name) }
+                .to_string_lossy()
+                .to_string();
+            return Some((name, uid, gid));
         }
     }
     // Fall back to the standard `nobody` account.
     let cname = std::ffi::CString::new("nobody").ok()?;
+    // SAFETY: passwd is a plain C struct; all-zero is a valid value.
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0u8; 1024];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is valid and `buf.len()` is its true length.
     let rc = unsafe {
         libc::getpwnam_r(
             cname.as_ptr(),
@@ -175,6 +189,7 @@ fn drop_target_user() -> Option<(String, u32, u32)> {
     if rc != 0 || result.is_null() || pwd.pw_uid == 0 {
         return None;
     }
+    // SAFETY: on success pw_name is a NUL-terminated string in `buf`.
     let name = unsafe { CStr::from_ptr(pwd.pw_name) }
         .to_string_lossy()
         .to_string();
@@ -376,10 +391,12 @@ live_path = ""
     )
     .await;
 
-    assert!(state.apps[0]
-        .instances
-        .iter()
-        .any(|i| i.restarts == 0 && i.phase == Phase::Ready));
+    assert!(
+        state.apps[0]
+            .instances
+            .iter()
+            .any(|i| i.restarts == 0 && i.phase == Phase::Ready)
+    );
 
     r.teardown().await;
 }
@@ -1071,8 +1088,11 @@ async fn env_isolation_and_inheritance() {
     let h = Harness::new(1);
     let allowed_key = "ARTZAIN_TEST_ALLOWED";
     let blocked_key = "ARTZAIN_TEST_BLOCKED";
-    std::env::set_var(allowed_key, "yes");
-    std::env::set_var(blocked_key, "no");
+    // SAFETY: the keys are unique to this test, and the only concurrent
+    // readers are std::env calls in other tests, which share std's env lock.
+    unsafe { std::env::set_var(allowed_key, "yes") };
+    // SAFETY: as above.
+    unsafe { std::env::set_var(blocked_key, "no") };
 
     let path = h.write_manifest(
         r#"
@@ -1116,8 +1136,10 @@ live_failures = 2
     );
 
     r.teardown().await;
-    std::env::remove_var(allowed_key);
-    std::env::remove_var(blocked_key);
+    // SAFETY: as for the set_var calls above.
+    unsafe { std::env::remove_var(allowed_key) };
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(blocked_key) };
 }
 
 #[tokio::test]
@@ -1229,7 +1251,6 @@ bin = "{{fixture}}"
 port = {{port}}
 replicas = 1
 user = "{{user}}"
-group = "{{user}}"
 ready_path = "/__ready"
 live_path = "/__health"
 ready_timeout = 5
@@ -1342,7 +1363,10 @@ async fn orphan_reclaim_kills_prior_children() {
         state_version: 1,
         project: "test".to_string(),
         owner_pid: 999_999,
-        updated_at: 0,
+        updated_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
         apps: vec![AppStatus {
             name: "web".to_string(),
             desired: 1,

@@ -11,7 +11,7 @@ mod systemd;
 
 use std::path::PathBuf;
 
-use artzain_core::{lock::Lock, plan, read_status, up, UpOptions, DEFAULT_MANIFEST, STOP_GRACE};
+use artzain_core::{DEFAULT_MANIFEST, STOP_GRACE, UpOptions, lock, plan, read_status, up};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -210,7 +210,7 @@ fn generate_systemd(
         binary: &binary,
         memory_max,
         stop_grace_secs: STOP_GRACE.as_secs(),
-    });
+    })?;
 
     if install {
         let path = std::path::Path::new("/etc/systemd/system/artzain@.service");
@@ -260,57 +260,26 @@ fn print_logs(
 }
 
 fn down(file: &std::path::Path, force: bool) -> anyhow::Result<()> {
-    let state = read_status(file)?;
-    let pid = state.owner_pid as i32;
+    let base_dir = file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    if !force {
-        // Verify the lock file points to the same live pid before sending SIGTERM.
-        // This avoids killing an unrelated process that reused a stale pid.
-        let base_dir = file
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        match Lock::read(&base_dir)? {
-            Some(lock) if lock.pid == state.owner_pid => {
-                if !is_pid_alive(pid) {
-                    anyhow::bail!(
-                        "cluster owner pid {pid} is not running; the cluster may already be down (use --force to override)"
-                    );
-                }
-            }
-            Some(_) => anyhow::bail!("lock file does not match state owner pid — refusing to signal an unrelated process (use --force to override)"),
-            None => anyhow::bail!("no lock file found; the cluster may already be down (use --force to override)"),
+    // Only the process that holds the lock is signalled: a pid read from a
+    // file could have been recycled by an unrelated process.
+    let pid = match lock::signal_owner(&base_dir) {
+        Ok(pid) => pid,
+        Err(e) if force => {
+            let pid = read_status(file)?.owner_pid;
+            eprintln!("{e:#}; --force: signalling recorded owner pid {pid}");
+            lock::force_signal(pid)?;
+            pid
         }
-    }
-
-    // SIGTERM the `up` process; its own teardown stops every child group.
-    let rc = unsafe { libc_kill(pid, 15) };
-    if rc != 0 {
-        anyhow::bail!("could not signal cluster owner pid {pid} — is it still running?");
-    }
+        Err(e) => anyhow::bail!("{e:#} (use --force to signal the recorded owner pid anyway)"),
+    };
     println!("sent SIGTERM to cluster owner pid {pid}");
     Ok(())
-}
-
-#[cfg(unix)]
-fn is_pid_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    // SAFETY: kill(pid, 0) is a pure liveness check.
-    unsafe { libc_kill(pid, 0) == 0 }
-}
-
-#[cfg(not(unix))]
-fn is_pid_alive(_pid: i32) -> bool {
-    true
-}
-
-// The binary crate avoids a direct libc dep for one call; declare the symbol.
-extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 fn now_unix() -> u64 {

@@ -1,24 +1,27 @@
-//! Bounded log reading and following for `artzain logs`.
+//! Bounded log reading and following for `artzain logs`. Log lines are app
+//! output and may carry attacker-chosen bytes, so everything printed goes
+//! through [`sanitize_line`].
 
-use std::collections::HashMap;
+use artzain_core::sanitize_line;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Collect the sorted list of log files matching the optional app prefix.
+const FOLLOW_CHUNK: u64 = 1024 * 1024;
+
+/// Collect the sorted list of log files for `app` (default: all apps).
 pub fn log_files(log_dir: &Path, app: Option<&str>) -> anyhow::Result<Vec<PathBuf>> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(log_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         .map(|e| e.path())
-        .filter(|p| {
-            if let Some(app) = app {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.starts_with(app))
-                    .unwrap_or(false)
-            } else {
-                true
-            }
+        .filter(|p| match app {
+            Some(app) => p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.rsplit_once('-'))
+                .is_some_and(|(name, _)| name == app),
+            None => true,
         })
         .collect();
     entries.sort();
@@ -28,47 +31,53 @@ pub fn log_files(log_dir: &Path, app: Option<&str>) -> anyhow::Result<Vec<PathBu
 /// Read the last `n` lines of `path` and print them to stdout.
 pub fn tail(path: &Path, n: usize) -> anyhow::Result<()> {
     let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
-    let mut ring: Vec<String> = Vec::with_capacity(n);
-    for line in reader.lines() {
-        let line = line?;
-        if ring.len() == n {
-            ring.remove(0);
-        }
-        ring.push(line);
+    let mut reader = std::io::BufReader::new(file);
+    let mut ring: VecDeque<String> = VecDeque::with_capacity(n.min(4096));
+    let mut raw = Vec::new();
+    if n == 0 {
+        return Ok(());
     }
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
+    loop {
+        raw.clear();
+        if reader.read_until(b'\n', &mut raw)? == 0 {
+            break;
+        }
+        if ring.len() == n {
+            ring.pop_front();
+        }
+        ring.push_back(printable(&raw));
+    }
+    let mut stdout = std::io::stdout().lock();
     for line in ring {
-        writeln!(stdout, "{}", line)?;
+        writeln!(stdout, "{line}")?;
     }
     Ok(())
+}
+
+fn printable(raw: &[u8]) -> String {
+    let line = String::from_utf8_lossy(raw);
+    sanitize_line(line.trim_end_matches(['\n', '\r']))
 }
 
 /// Follow the given log files, printing any new lines as they appear. Rotated
 /// files (the active file shrinks or is replaced) are re-read from the start.
 /// The loop stops on SIGINT/SIGTERM (the process exits).
 pub fn follow(paths: &[PathBuf], interval: std::time::Duration) -> anyhow::Result<()> {
-    // Track the read position for each path. We also store the file size at
-    // the time of the last read so we can detect truncation/rotation.
     let mut state: HashMap<PathBuf, (u64, u64)> = HashMap::new(); // (position, last_size)
-    let stdout = std::io::stdout();
 
     loop {
         for path in paths {
             let (pos, last_size) = state.get(path).copied().unwrap_or((0, 0));
 
-            let meta = match std::fs::metadata(path) {
-                Ok(m) => m,
-                Err(_) => continue,
+            let Ok(meta) = std::fs::metadata(path) else {
+                continue;
             };
             let size = meta.len();
 
             let (new_pos, new_size) = if size < last_size || size < pos {
-                // File was rotated or truncated: start over.
-                read_from(path, 0, &stdout)?
+                read_from(path, 0)?
             } else if size > pos {
-                read_from(path, pos, &stdout)?
+                read_from(path, pos)?
             } else {
                 (pos, size)
             };
@@ -80,20 +89,27 @@ pub fn follow(paths: &[PathBuf], interval: std::time::Duration) -> anyhow::Resul
     }
 }
 
-fn read_from(path: &Path, start: u64, stdout: &std::io::Stdout) -> anyhow::Result<(u64, u64)> {
+/// Print whole lines from `start`, at most `FOLLOW_CHUNK` bytes per call; a
+/// trailing partial line is left for the next call.
+fn read_from(path: &Path, start: u64) -> anyhow::Result<(u64, u64)> {
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut buf = String::new();
-    reader.read_to_string(&mut buf)?;
+    let mut buf = Vec::new();
+    file.take(FOLLOW_CHUNK).read_to_end(&mut buf)?;
 
-    let mut lock = stdout.lock();
-    lock.write_all(buf.as_bytes())?;
-    lock.flush()?;
+    let complete = match buf.iter().rposition(|&b| b == b'\n') {
+        Some(i) => i + 1,
+        None if buf.len() as u64 == FOLLOW_CHUNK => buf.len(),
+        None => 0,
+    };
+    let mut stdout = std::io::stdout().lock();
+    for line in buf[..complete].split_inclusive(|&b| b == b'\n') {
+        writeln!(stdout, "{}", printable(line))?;
+    }
+    stdout.flush()?;
 
-    let pos = reader.stream_position()?;
     let size = std::fs::metadata(path)?.len();
-    Ok((pos, size))
+    Ok((start + complete as u64, size))
 }
 
 #[cfg(test)]
@@ -108,8 +124,6 @@ mod tests {
             writeln!(tmp, "line {}", i).unwrap();
         }
         tail(tmp.path(), 3).unwrap();
-        // Output is printed to stdout; just assert no panic and capacity.
-        // A more thorough test would capture stdout.
         assert!(tmp.path().exists());
     }
 
@@ -117,5 +131,31 @@ mod tests {
     fn tail_empty_file() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         tail(tmp.path(), 5).unwrap();
+    }
+
+    #[test]
+    fn tail_survives_invalid_utf8() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"ok\n\xff\xfe\n").unwrap();
+        tail(tmp.path(), 5).unwrap();
+    }
+
+    #[test]
+    fn printable_strips_terminal_escapes() {
+        assert_eq!(printable(b"\x1b]0;pwned\x07hi\r\n"), "?]0;pwned?hi");
+    }
+
+    #[test]
+    fn app_filter_matches_whole_names_only() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["api-0.log", "api-1.log", "api-admin-0.log", "apiv2-0.log"] {
+            std::fs::write(dir.path().join(f), b"").unwrap();
+        }
+        let names: Vec<_> = log_files(dir.path(), Some("api"))
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["api-0.log", "api-1.log"]);
     }
 }

@@ -129,9 +129,8 @@ pub struct Check {
 }
 
 /// Resource limits applied to the child before exec. These are advisory on
-/// some platforms; artzain applies them fail-closed on Unix and errors on load
-/// when declared on non-Unix builds.
-#[derive(Debug, Clone, Deserialize)]
+/// some platforms; artzain applies them fail-closed before exec.
+#[derive(Debug, Clone, Hash, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     /// Maximum number of open file descriptors (`RLIMIT_NOFILE`).
@@ -221,79 +220,31 @@ fn default_live_failures() -> u32 {
     3
 }
 
-/// Resolve a user name to `(uid, primary_gid)`. Returns `None` if the user
-/// does not exist or the lookup fails.
-#[cfg(unix)]
-fn lookup_user(name: &str) -> Option<(u32, u32)> {
-    use std::ffi::CString;
-    let cname = CString::new(name).ok()?;
-    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut buf = vec![0u8; 2048];
-    let mut result: *mut libc::passwd = std::ptr::null_mut();
-    loop {
-        let rc = unsafe {
-            libc::getpwnam_r(
-                cname.as_ptr(),
-                &mut pwd,
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len(),
-                &mut result,
-            )
-        };
-        if rc == 0 {
-            break;
-        }
-        if rc != libc::ERANGE {
-            return None;
-        }
-        buf.resize(buf.len() * 2, 0);
-    }
-    if result.is_null() {
-        return None;
-    }
-    Some((pwd.pw_uid, pwd.pw_gid))
+/// Longest duration any timer in the manifest may ask for. Bigger values
+/// would overflow `Instant` arithmetic and panic the reconciler.
+const MAX_DURATION_SECS: u64 = 365 * 24 * 60 * 60;
+const MAX_NAME_LEN: usize = 64;
+
+/// App and check names become file names (`.artzain/logs/<app>-<n>.log`) and
+/// terminal output, so they are restricted to a plain identifier.
+fn valid_name(name: &str) -> bool {
+    name.len() <= MAX_NAME_LEN
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-#[cfg(not(unix))]
-fn lookup_user(_name: &str) -> Option<(u32, u32)> {
-    None
+/// A probe path is written verbatim into an HTTP request line.
+fn valid_probe_path(path: &str) -> bool {
+    path.starts_with('/') && !path.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// Resolve a group name to a gid.
-#[cfg(unix)]
-fn lookup_group(name: &str) -> Option<u32> {
-    use std::ffi::CString;
-    let cname = CString::new(name).ok()?;
-    let mut grp: libc::group = unsafe { std::mem::zeroed() };
-    let mut buf = vec![0u8; 1024];
-    let mut result: *mut libc::group = std::ptr::null_mut();
-    loop {
-        let rc = unsafe {
-            libc::getgrnam_r(
-                cname.as_ptr(),
-                &mut grp,
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len(),
-                &mut result,
-            )
-        };
-        if rc == 0 {
-            break;
-        }
-        if rc != libc::ERANGE {
-            return None;
-        }
-        buf.resize(buf.len() * 2, 0);
-    }
-    if result.is_null() {
-        return None;
-    }
-    Some(grp.gr_gid)
-}
-
-#[cfg(not(unix))]
-fn lookup_group(_name: &str) -> Option<u32> {
-    None
+fn valid_addr(addr: &str) -> bool {
+    !addr.is_empty() && !addr.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 impl Manifest {
@@ -335,7 +286,66 @@ impl Manifest {
     fn validate(&mut self) -> anyhow::Result<()> {
         let mut errors = Vec::new();
         let mut names = HashSet::new();
+        let secs = |field: &str, v: u64, errors: &mut Vec<String>| {
+            if v > MAX_DURATION_SECS {
+                errors.push(format!("{field} = {v} exceeds {MAX_DURATION_SECS}"));
+            }
+        };
+        let d = &self.defaults;
+        secs(
+            "defaults.stable_after_secs",
+            d.stable_after_secs,
+            &mut errors,
+        );
+        secs(
+            "defaults.restart_backoff_ms",
+            d.restart_backoff_ms / 1000,
+            &mut errors,
+        );
+        secs(
+            "defaults.restart_backoff_max_ms",
+            d.restart_backoff_max_ms / 1000,
+            &mut errors,
+        );
         for a in &self.apps {
+            if !valid_name(&a.name) {
+                errors.push(format!(
+                    "app name `{}` must be 1-{MAX_NAME_LEN} of [A-Za-z0-9._-], starting alphanumeric",
+                    a.name.escape_debug()
+                ));
+            }
+            secs(
+                &format!("app `{}` ready_timeout", a.name),
+                a.ready_timeout,
+                &mut errors,
+            );
+            secs(
+                &format!("app `{}` live_period", a.name),
+                a.live_period,
+                &mut errors,
+            );
+            for (field, path) in [("ready_path", &a.ready_path), ("live_path", &a.live_path)] {
+                if !path.is_empty() && !valid_probe_path(path) {
+                    errors.push(format!(
+                        "app `{}`: {field} must start with `/` and contain no whitespace",
+                        a.name
+                    ));
+                }
+            }
+            if a.group.is_some() && a.user.is_none() {
+                errors.push(format!(
+                    "app `{}`: `group` without `user` would still run as artzain's user",
+                    a.name
+                ));
+            }
+            if let Some(mb) = a.limits.as_ref().and_then(|l| l.memory_mb)
+                && mb.checked_mul(1024 * 1024).is_none()
+            {
+                errors.push(format!(
+                    "app `{}`: limits.memory_mb = {mb} overflows",
+                    a.name
+                ));
+            }
             if !names.insert(a.name.as_str()) {
                 errors.push(format!("duplicate app name `{}`", a.name));
             }
@@ -352,6 +362,17 @@ impl Manifest {
             }
         }
         for c in &self.checks {
+            if !valid_name(&c.name) {
+                errors.push(format!(
+                    "check name `{}` must be 1-{MAX_NAME_LEN} of [A-Za-z0-9._-], starting alphanumeric",
+                    c.name.escape_debug()
+                ));
+            }
+            if c.tcp.as_deref().is_some_and(|a| !valid_addr(a))
+                || c.http.as_deref().is_some_and(|a| !valid_addr(a))
+            {
+                errors.push(format!("check `{}`: address contains whitespace", c.name));
+            }
             if !names.insert(c.name.as_str()) {
                 errors.push(format!("check `{}` collides with another name", c.name));
             }
@@ -385,30 +406,12 @@ impl Manifest {
             }
         }
 
-        // Security fields are Unix-only; fail-closed if declared elsewhere.
-        #[cfg(not(unix))]
-        for a in &self.apps {
-            if a.user.is_some() {
-                errors.push(format!("app `{}`: user is only supported on Unix", a.name));
-            }
-            if a.group.is_some() {
-                errors.push(format!("app `{}`: group is only supported on Unix", a.name));
-            }
-            if a.limits.is_some() {
-                errors.push(format!(
-                    "app `{}`: limits are only supported on Unix",
-                    a.name
-                ));
-            }
-        }
-
         // Resolve user/group names to uid/gid and store them for spawn.
-        #[cfg(unix)]
         for a in &mut self.apps {
             let mut uid = None;
             let mut gid = None;
             if let Some(user) = &a.user {
-                match lookup_user(user) {
+                match crate::sys::lookup_user(user) {
                     Some((u, primary_gid)) => {
                         uid = Some(u);
                         gid = Some(primary_gid);
@@ -417,7 +420,7 @@ impl Manifest {
                 }
             }
             if let Some(group) = &a.group {
-                match lookup_group(group) {
+                match crate::sys::lookup_group(group) {
                     Some(g) => gid = Some(g),
                     None => errors.push(format!("app `{}`: unknown group `{group}`", a.name)),
                 }
@@ -475,6 +478,10 @@ impl Manifest {
 /// `ARTZAIN_VAR_<NAME>` env var overrides the file value). `$$` escapes a
 /// literal `$`, so values like `$$HOME` or `$${foo}` are preserved. Unknown
 /// `${...}` references are errors — typos should not silently parse.
+///
+/// Substitution is textual, so a value that could close a TOML string (a
+/// quote, a backslash, a newline) is rejected: otherwise an
+/// `ARTZAIN_VAR_*` value could inject whole `[[app]]` tables.
 fn interpolate_vars(raw: &str, path: &Path) -> anyhow::Result<String> {
     #[derive(Deserialize)]
     struct VarsOnly {
@@ -513,6 +520,16 @@ fn interpolate_vars(raw: &str, path: &Path) -> anyhow::Result<String> {
         };
         let name = &after[..end];
         match resolve(name) {
+            Some(value)
+                if value
+                    .chars()
+                    .any(|c| matches!(c, '"' | '\'' | '\\') || c.is_control()) =>
+            {
+                anyhow::bail!(
+                    "{}: variable ${{{name}}} contains a quote, backslash or control character",
+                    path.display()
+                )
+            }
             Some(value) => out.push_str(&value),
             None => anyhow::bail!(
                 "{}: unknown variable ${{{name}}} — define it under [vars] or set ARTZAIN_VAR_{}",
@@ -687,6 +704,85 @@ port = 8080
         )
         .unwrap();
         assert_eq!(m2.apps[0].bin, PathBuf::from("/srv/app/data-$HOME"));
+    }
+
+    #[test]
+    fn var_values_cannot_break_out_of_a_string() {
+        let err = parse(
+            r#"
+[vars]
+root = "x\"\n[[app]]\nname = \"evil\""
+
+[[app]]
+name = "data"
+bin = "${root}/data"
+port = 8080
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("quote, backslash or control"));
+    }
+
+    #[test]
+    fn rejects_names_that_escape_the_log_dir() {
+        for name in ["../../etc/cron.d/x", "a/b", ".hidden", "", "x\\u001b[2J"] {
+            let src = format!("[[app]]\nname = \"{name}\"\nbin = \"./x\"\nport = 8080\n");
+            let err = parse(&src).unwrap_err();
+            assert!(err.to_string().contains("app name"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_probe_paths_that_inject_headers() {
+        let err = parse(
+            r#"
+[[app]]
+name = "x"
+bin = "./x"
+port = 8080
+ready_path = "/r HTTP/1.1\r\nX-Evil: 1"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ready_path"));
+    }
+
+    #[test]
+    fn rejects_timers_that_would_overflow() {
+        let err = parse(
+            r#"
+[defaults]
+restart_backoff_max_ms = 9223372036854775807
+
+[[app]]
+name = "x"
+bin = "./x"
+port = 8080
+ready_timeout = 9223372036854775807
+"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("restart_backoff_max_ms"), "{msg}");
+        assert!(msg.contains("ready_timeout"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_memory_limit_overflow_and_group_without_user() {
+        let err = parse(
+            r#"
+[[app]]
+name = "x"
+bin = "./x"
+port = 8080
+group = "nogroup"
+limits = { memory_mb = 9223372036854775807 }
+"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("memory_mb"), "{msg}");
+        assert!(msg.contains("without `user`"), "{msg}");
     }
 
     #[test]
