@@ -5,7 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -23,6 +22,10 @@ clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true

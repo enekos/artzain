@@ -5,12 +5,18 @@
 
 use crate::manifest::Limits;
 use crate::paths::{open_private_log_file, open_private_log_file_sync};
+use crate::sys;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+
+/// Longest log line kept; the rest of an over-long line is dropped so a child
+/// that never prints a newline cannot grow artzain's memory without bound.
+pub const MAX_LOG_LINE: usize = 16 * 1024;
+const LOG_QUEUE: usize = 1024;
 
 const PALETTE: &[&str] = &["36", "32", "33", "35", "34", "96", "92", "93", "95", "94"];
 
@@ -25,8 +31,43 @@ fn tag(app: &str, replica: u32, color: &str) -> String {
     format!("\x1b[{color}m[{label:<14}]\x1b[0m")
 }
 
+/// Replace terminal control characters (ANSI escapes, `\r`, backspace, …)
+/// with `?`, keeping tabs. App output is attacker-influenced — a request path
+/// an app logs ends up here — and must not drive the operator's terminal.
+pub fn sanitize_line(line: &str) -> String {
+    line.chars()
+        .map(|c| if c.is_control() && c != '\t' { '?' } else { c })
+        .collect()
+}
+
+/// Read one `\n`-terminated line, keeping at most `MAX_LOG_LINE` bytes of it.
+/// `None` at end of stream or on a read error.
+pub(crate) async fn read_bounded_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Option<String> {
+    let mut line = Vec::new();
+    let mut seen_any = false;
+    loop {
+        let buf = reader.fill_buf().await.ok()?;
+        if buf.is_empty() {
+            return seen_any.then(|| String::from_utf8_lossy(&line).into_owned());
+        }
+        seen_any = true;
+        let (chunk, done) = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => (&buf[..i], i + 1),
+            None => (buf, buf.len()),
+        };
+        let room = MAX_LOG_LINE.saturating_sub(line.len());
+        line.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        let newline = done > chunk.len();
+        reader.consume(done);
+        if newline {
+            return Some(String::from_utf8_lossy(&line).into_owned());
+        }
+    }
+}
+
 /// Everything needed to launch one instance. The reconciler builds this from
 /// the manifest `App` plus the assigned replica index / port.
+#[derive(Debug)]
 pub struct Spawn<'a> {
     pub app: &'a str,
     pub replica: u32,
@@ -50,6 +91,7 @@ pub struct Spawn<'a> {
 }
 
 /// A live child plus the bookkeeping needed to signal and label it.
+#[derive(Debug)]
 pub struct Handle {
     pub child: Child,
     pub pgid: i32,
@@ -76,51 +118,7 @@ pub fn spawn(s: &Spawn) -> anyhow::Result<Handle> {
         cmd.env(k, v);
     }
 
-    // Privilege drop and rlimits run in the child after fork and before exec.
-    // Only async-signal-safe functions are used inside this closure.
-    #[cfg(unix)]
-    {
-        let uid = s.uid;
-        let gid = s.gid;
-        let limits = s.limits.clone();
-        unsafe {
-            cmd.pre_exec(move || {
-                if let Some(gid) = gid {
-                    if libc::setgroups(0, std::ptr::null()) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if libc::setgid(gid as libc::gid_t) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                if let Some(uid) = uid {
-                    if libc::setuid(uid as libc::uid_t) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                if let Some(ref limits) = limits {
-                    if let Some(nofile) = limits.open_files {
-                        let mut rl: libc::rlimit = std::mem::zeroed();
-                        rl.rlim_cur = nofile;
-                        rl.rlim_max = nofile;
-                        if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    }
-                    if let Some(memory_mb) = limits.memory_mb {
-                        let bytes = memory_mb * 1024 * 1024;
-                        let mut rl: libc::rlimit = std::mem::zeroed();
-                        rl.rlim_cur = bytes;
-                        rl.rlim_max = bytes;
-                        if libc::setrlimit(libc::RLIMIT_AS, &rl) != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    }
-                }
-                Ok(())
-            });
-        }
-    }
+    sys::drop_privileges_before_exec(&mut cmd, s.uid, s.gid, s.limits.clone());
 
     let mut child = cmd.spawn().map_err(|e| {
         anyhow::anyhow!(
@@ -130,7 +128,10 @@ pub fn spawn(s: &Spawn) -> anyhow::Result<Handle> {
             s.bin.display()
         )
     })?;
-    let pgid = child.id().map(|pid| pid as i32).unwrap_or(0);
+    let pgid = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .unwrap_or(0);
     stream_logs(
         &tag,
         child.stdout.take(),
@@ -157,51 +158,7 @@ pub fn kill(handle: &Handle) {
 /// Negative pid signals the whole process group (the binary plus any children
 /// it forked), so nothing is orphaned to keep holding a port.
 pub(crate) fn signal_group(pgid: i32, signal: i32) {
-    if pgid > 0 {
-        unsafe { libc::kill(-pgid, signal) };
-    }
-}
-
-/// Check whether a process is still alive. Returns `false` for invalid or
-/// non-existent pids.
-#[cfg(unix)]
-pub(crate) fn is_pid_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    let rc = unsafe { libc::kill(pid, 0) };
-    if rc == 0 {
-        return true;
-    }
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    errno != libc::ESRCH
-}
-
-#[cfg(not(unix))]
-pub(crate) fn is_pid_alive(_pid: i32) -> bool {
-    false
-}
-
-/// Check whether a process group still exists. Returns `false` for invalid or
-/// non-existent groups.
-#[cfg(unix)]
-pub(crate) fn is_group_alive(pgid: i32) -> bool {
-    if pgid <= 0 {
-        return false;
-    }
-    let rc = unsafe { libc::kill(-pgid, 0) };
-    if rc == 0 {
-        return true;
-    }
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    // EPERM means the group exists but we lack permission to signal it; treat
-    // as alive so we don't declare a still-running orphan "done".
-    errno != libc::ESRCH
-}
-
-#[cfg(not(unix))]
-pub(crate) fn is_group_alive(_pgid: i32) -> bool {
-    false
+    sys::signal_group(pgid, signal);
 }
 
 /// PIDs listening on a TCP port, via `lsof`. Empty if none — or if `lsof` is
@@ -230,71 +187,57 @@ fn stream_logs(
     log_max_bytes: u64,
     log_keep: u32,
 ) {
-    let Some(path) = log_path else {
-        // No log file requested: print to console only.
-        if let Some(out) = stdout {
-            let tag = tag.to_string();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(out).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    println!("{tag} {line}");
-                }
-            });
-        }
-        if let Some(err) = stderr {
-            let tag = tag.to_string();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(err).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    eprintln!("{tag} {line}");
-                }
-            });
-        }
-        return;
-    };
-
-    // Serialize stdout+stderr writes through a single writer task so rotation
-    // is atomic and the cap is respected across both streams. Open the file
-    // synchronously here so callers can rely on it existing once `spawn` returns.
-    let initial_file = match open_private_log_file_sync(&path) {
-        Ok(f) => Some(tokio::fs::File::from_std(f)),
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "could not open log file");
-            None
-        }
-    };
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
-    let path_clone = path.clone();
-    tokio::spawn(async move {
-        log_writer(rx, path_clone, initial_file, log_max_bytes, log_keep).await;
-    });
-
-    if let Some(out) = stdout {
-        let tag = tag.to_string();
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(out).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                println!("{tag} {line}");
-                let _ = tx.send(line);
+    let tx = log_path.map(|path| {
+        // Serialize stdout+stderr writes through a single writer task so
+        // rotation is atomic and the cap is respected across both streams.
+        // Open the file synchronously here so callers can rely on it existing
+        // once `spawn` returns. The queue is bounded: a slow disk applies
+        // backpressure to the child's pipe instead of growing memory.
+        let initial_file = match open_private_log_file_sync(&path) {
+            Ok(f) => Some(tokio::fs::File::from_std(f)),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "could not open log file");
+                None
             }
-        });
+        };
+        let (tx, rx) = mpsc::channel::<String>(LOG_QUEUE);
+        tokio::spawn(log_writer(rx, path, initial_file, log_max_bytes, log_keep));
+        tx
+    });
+    if let Some(out) = stdout {
+        tokio::spawn(pump(
+            BufReader::new(out),
+            tag.to_string(),
+            tx.clone(),
+            false,
+        ));
     }
     if let Some(err) = stderr {
-        let tag = tag.to_string();
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(err).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("{tag} {line}");
-                let _ = tx.send(line);
-            }
-        });
+        tokio::spawn(pump(BufReader::new(err), tag.to_string(), tx, true));
+    }
+}
+
+async fn pump<R: AsyncBufRead + Unpin>(
+    mut reader: R,
+    tag: String,
+    tx: Option<mpsc::Sender<String>>,
+    to_stderr: bool,
+) {
+    while let Some(line) = read_bounded_line(&mut reader).await {
+        let line = sanitize_line(&line);
+        if to_stderr {
+            eprintln!("{tag} {line}");
+        } else {
+            println!("{tag} {line}");
+        }
+        if let Some(tx) = &tx {
+            let _ = tx.send(line).await;
+        }
     }
 }
 
 async fn log_writer(
-    mut rx: mpsc::UnboundedReceiver<String>,
+    mut rx: mpsc::Receiver<String>,
     path: PathBuf,
     mut file: Option<tokio::fs::File>,
     max_bytes: u64,
@@ -364,4 +307,43 @@ async fn rotate_log(path: &Path, keep: u32) -> std::io::Result<()> {
     let backup = path.with_extension("log.1");
     tokio::fs::rename(path, &backup).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn lines(input: &[u8]) -> Vec<String> {
+        let mut reader = BufReader::with_capacity(7, input);
+        let mut out = Vec::new();
+        while let Some(line) = read_bounded_line(&mut reader).await {
+            out.push(line);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn splits_lines_across_buffer_refills() {
+        assert_eq!(
+            lines(b"hello world\nsecond\nlast").await,
+            ["hello world", "second", "last"]
+        );
+        assert!(lines(b"").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn caps_a_line_that_never_ends() {
+        let mut input = vec![b'x'; MAX_LOG_LINE * 4];
+        input.extend_from_slice(b"\nnext\n");
+        let got = lines(&input).await;
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].len(), MAX_LOG_LINE);
+        assert_eq!(got[1], "next");
+    }
+
+    #[test]
+    fn sanitize_neutralises_terminal_control() {
+        assert_eq!(sanitize_line("a\x1b[2Jb\tc\r\x08"), "a?[2Jb\tc??");
+        assert_eq!(sanitize_line("naïve ✓"), "naïve ✓");
+    }
 }

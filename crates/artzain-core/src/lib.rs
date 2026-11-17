@@ -10,6 +10,9 @@
 //! gracefully on Ctrl-C. No git, no Docker, no daemon — a file is the whole
 //! control plane.
 
+#[cfg(not(unix))]
+compile_error!("artzain supervises Unix process groups and supports Unix only");
+
 pub mod lock;
 pub mod manifest;
 mod paths;
@@ -17,10 +20,12 @@ mod probe;
 mod process;
 mod reconcile;
 mod state;
+mod sys;
 
 pub use manifest::Manifest;
+pub use process::sanitize_line;
 pub use reconcile::{
-    reclaim_orphans, run_until, select_apps, up, Reconciler, UpOptions, STOP_GRACE,
+    Reconciler, STOP_GRACE, UpOptions, reclaim_orphans, run_until, select_apps, up,
 };
 pub use state::{AppStatus, ClusterState, InstanceStatus, Phase};
 
@@ -49,7 +54,7 @@ pub fn plan(manifest_path: &Path, only: Option<&[String]>) -> anyhow::Result<()>
         let ports = if app.replicas == 1 {
             app.port.to_string()
         } else {
-            format!("{}-{}", app.port, app.port + app.replicas as u16 - 1)
+            format!("{}-{}", app.port, u32::from(app.port) + app.replicas - 1)
         };
         println!(
             "app:     {} x{} — {} (ports {ports})",
@@ -83,35 +88,28 @@ pub fn read_status(manifest_path: &Path) -> anyhow::Result<ClusterState> {
 /// so if it dies without running teardown every child is orphaned and keeps
 /// holding its port, and the next `up` can't bind.
 pub(crate) async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate()).ok();
-        let mut hup = signal(SignalKind::hangup()).ok();
-        let term = async {
-            match term.as_mut() {
-                Some(s) => {
-                    s.recv().await;
-                }
-                None => std::future::pending::<()>().await,
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).ok();
+    let mut hup = signal(SignalKind::hangup()).ok();
+    let term = async {
+        match term.as_mut() {
+            Some(s) => {
+                s.recv().await;
             }
-        };
-        let hup = async {
-            match hup.as_mut() {
-                Some(s) => {
-                    s.recv().await;
-                }
-                None => std::future::pending::<()>().await,
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term => {}
-            _ = hup => {}
+            None => std::future::pending::<()>().await,
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+    };
+    let hup = async {
+        match hup.as_mut() {
+            Some(s) => {
+                s.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term => {}
+        _ = hup => {}
     }
 }

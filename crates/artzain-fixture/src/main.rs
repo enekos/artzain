@@ -13,6 +13,8 @@
 //! artzain injected, `/__id` to assert on uid/gid after a privilege drop, and
 //! `/__limits` to assert on applied `RLIMIT_NOFILE` / `RLIMIT_AS`.
 
+#![allow(unsafe_code, reason = "test fixture reports its uid/gid via libc")]
+
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -132,9 +134,11 @@ fn env_json() -> String {
 
 #[cfg(unix)]
 fn id_json() -> String {
-    format!("uid={}\ngid={}", unsafe { libc::getuid() }, unsafe {
-        libc::getgid()
-    })
+    // SAFETY: getuid(2) has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    // SAFETY: getgid(2) has no preconditions and cannot fail.
+    let gid = unsafe { libc::getgid() };
+    format!("uid={uid}\ngid={gid}")
 }
 
 #[cfg(not(unix))]
